@@ -855,7 +855,7 @@ class TestDispatcherRegistry:
         from neuroflow_core.osw_engine import DispatcherRegistry
 
         reg = DispatcherRegistry()
-        with pytest.raises(KeyError, match="No dispatcher registered"):
+        with pytest.raises(RuntimeError, match="No default dispatcher registered"):
             reg.dispatch("x")
 
 

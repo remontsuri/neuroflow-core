@@ -68,7 +68,14 @@ def config_from_env() -> IngestorConfig:
                         break
 
     db_path = os.environ.get("NEUROFLOW_DB_PATH", "/data/neuroflow.db")
-    return IngestorConfig(bot_token=token, db_path=db_path)
+    rate_max = int(os.environ.get("RATE_LIMIT_MAX_EVENTS", "0"))
+    rate_window = int(float(os.environ.get("RATE_LIMIT_WINDOW_S", "60")))
+    return IngestorConfig(
+        bot_token=token,
+        db_path=db_path,
+        rate_limit_max_events=rate_max,
+        rate_limit_window_s=rate_window,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +203,10 @@ class RateLimiter:
     def __init__(self, max_events: int = 0, window_s: int = 60):
         self.max_events = max_events
         self.window_s = window_s
-        self._buckets: dict[int, list[float]] = {}
+        self._buckets: dict[int | str, list[float]] = {}
         self._lock = threading.Lock()
 
-    def allow(self, user_id: int) -> bool:
+    def allow(self, user_id: int | str) -> bool:
         """Check whether *user_id* may fire another event. Idempotent.*"""
         if self.max_events <= 0:
             return True  # disabled
@@ -220,7 +227,7 @@ class RateLimiter:
             self._buckets[user_id] = timestamps
             return True
 
-    def remaining(self, user_id: int) -> int:
+    def remaining(self, user_id: int | str) -> int:
         """How many more events *user_id* can fire within the current window."""
         if self.max_events <= 0:
             return 999
@@ -230,7 +237,7 @@ class RateLimiter:
             timestamps = [t for t in self._buckets.get(user_id, []) if t > cutoff]
         return max(0, self.max_events - len(timestamps))
 
-    def reset(self, user_id: int | None = None) -> None:
+    def reset(self, user_id: int | str | None = None) -> None:
         """Clear tracking for *user_id*, or all users if None."""
         with self._lock:
             if user_id is not None:

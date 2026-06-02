@@ -43,7 +43,9 @@ class DispatcherRegistry:
         self._default_name: str = ""
 
     def register(self, name: str, fn: DispatchFn, *, default: bool = False) -> None:
-        """Register a dispatcher by name. Pass ``default=True`` to make it the default."""
+        """Register a dispatcher by name. Raises ValueError if already registered."""
+        if name in self._dispatchers:
+            raise ValueError(f"Dispatcher '{name}' is already registered")
         self._dispatchers[name] = fn
         if default or not self._default_name:
             self._default_name = name
@@ -56,6 +58,12 @@ class DispatcherRegistry:
         """Return all registered dispatcher names."""
         return list(self._dispatchers.keys())
 
+    def set_default(self, name: str) -> None:
+        """Change the default dispatcher. Raises KeyError if name isn't registered."""
+        if name not in self._dispatchers:
+            raise KeyError(f"No dispatcher registered: '{name}'")
+        self._default_name = name
+
     def get(self, name: str) -> DispatchFn:
         """Fetch a registered dispatcher by name."""
         if name not in self._dispatchers:
@@ -65,6 +73,8 @@ class DispatcherRegistry:
     def dispatch(self, prompt: str, name: str | None = None) -> str:
         """Run a prompt through the named (or default) dispatcher."""
         fn_name = name or self._default_name
+        if not fn_name:
+            raise RuntimeError("No default dispatcher registered")
         if fn_name not in self._dispatchers:
             raise KeyError(
                 f"No dispatcher registered: '{fn_name}'. "
@@ -202,10 +212,19 @@ class GraphMemory:
             "NEUROFLOW_MEMORY_PATH", "/tmp/graph_memory.db"
         )
         self._lock = threading.Lock()
+        # :memory: databases are per-connection, so keep one open
+        self._persistent_conn: sqlite3.Connection | None = None
+        if self._db_path == ":memory:":
+            self._persistent_conn = sqlite3.connect(self._db_path)
         self._init_db()
 
+    def _conn(self) -> sqlite3.Connection:
+        if self._persistent_conn is not None:
+            return self._persistent_conn
+        return sqlite3.connect(self._db_path)
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS facts (
                     key TEXT PRIMARY KEY,
@@ -221,7 +240,7 @@ class GraphMemory:
             """)
 
     def remember(self, key: str, value: str, source: str = "system") -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO facts (key, value, source, trust, timestamp)
                    VALUES (?, ?, ?, 1.0, ?)""",
@@ -229,7 +248,7 @@ class GraphMemory:
             )
 
     def recall(self, key: str) -> str | None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             row = conn.execute(
                 "SELECT value, trust FROM facts WHERE key = ?", (key,)
             ).fetchone()
@@ -238,7 +257,7 @@ class GraphMemory:
         return None
 
     def search(self, query: str, min_trust: float = 0.3, limit: int = 10) -> list[Fact]:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 """SELECT key, value, source, trust, timestamp FROM facts
                    WHERE (key LIKE ? OR value LIKE ?) AND trust >= ?
@@ -249,12 +268,12 @@ class GraphMemory:
                     for r in rows]
 
     def forget(self, key: str) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM facts WHERE key = ?", (key,))
 
     def run_decay(self, halflife_days: float = 7.0) -> int:
         """Lower trust for every fact. Returns how many dropped below 0.3 and were pruned."""
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             rows = conn.execute(
                 "SELECT key, trust, timestamp FROM facts"
             ).fetchall()
@@ -273,11 +292,11 @@ class GraphMemory:
             return pruned
 
     def clear(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             conn.execute("DELETE FROM facts")
 
     def stats(self) -> dict[str, Any]:
-        with sqlite3.connect(self._db_path) as conn:
+        with self._conn() as conn:
             total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
             avg_trust = conn.execute(
                 "SELECT AVG(trust) FROM facts"
@@ -477,7 +496,7 @@ class OSWEngine:
 
     def _is_terminal_node(self, node_id: str) -> bool:
         """Check if a node has no downstream dependents (leaf / sink node)."""
-        return not any(node_id in deps for deps in self.dag.edges.values())
+        return not bool(self.dag.children(node_id))
 
     def execute(self) -> dict[str, Any]:
         """Walk the DAG topologically and run each task. Returns {task_id: result}."""
@@ -493,6 +512,8 @@ class OSWEngine:
 
             agent = self.agents.get(agent_name) if agent_name else None
             if agent:
+                if agent.state_machine.is_terminal():
+                    agent.state_machine.reset()
                 agent.state_machine.transition(AgentState.WORKING)
 
             try:
