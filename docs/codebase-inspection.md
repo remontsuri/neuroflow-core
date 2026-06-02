@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-02  
 **Scope:** All 3 modules in `neuroflow_core/` + tests + project config  
-**Method:** Manual audit (Kanban worker crashed 13× on DeepSeek V4 Flash via routerai)
+**Method:** Manual audit
 
 ---
 

@@ -129,14 +129,10 @@ A lightweight orchestration engine for multi-step AI workflows.
 
 ### Install
 
-```bash
-pip install neuroflow-core
-```
-
-Or from source:
+From source (PyPI publication coming soon):
 
 ```bash
-git clone https://github.com/your-org/neuroflow-core.git
+git clone https://github.com/remontsuri/neuroflow-core.git
 cd neuroflow-core
 pip install -e .
 ```
@@ -405,7 +401,7 @@ Dataclass: `name`, `role` (default `"worker"`), `model`, `tools`,
 ### Setup
 
 ```bash
-git clone https://github.com/your-org/neuroflow-core.git
+git clone https://github.com/remontsuri/neuroflow-core.git
 cd neuroflow-core
 python -m venv .venv
 source .venv/bin/activate
