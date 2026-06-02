@@ -8,14 +8,17 @@ tasks to agents, and collects the output.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+DispatchFn = Callable[[str], str]
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +145,10 @@ class GraphMemory:
     and get pruned.
     """
 
-    def __init__(self, db_path: str = "/tmp/graph_memory.db"):
-        self._db_path = db_path
+    def __init__(self, db_path: str | None = None):
+        self._db_path = db_path or os.environ.get(
+            "NEUROFLOW_MEMORY_PATH", "/tmp/graph_memory.db"
+        )
         self._lock = threading.Lock()
         self._init_db()
 
@@ -242,7 +247,7 @@ class AgentState(Enum):
     CANCELLED = "cancelled"
 
 
-class StateMachine:
+class AgentStateMachine:
     """Agent lifecycle state machine with guarded transitions.
 
     Tries to go IDLE → FAILED directly? Nope — that's not in the allowed
@@ -297,7 +302,7 @@ class AgentCard:
     tools: list[str] = field(default_factory=list)
     max_retries: int = 3
     timeout_s: int = 300
-    state_machine: StateMachine = field(default_factory=StateMachine)
+    state_machine: AgentStateMachine = field(default_factory=AgentStateMachine)
 
     def is_available(self) -> bool:
         return self.state_machine.state == AgentState.IDLE
@@ -319,8 +324,19 @@ class OSWEngine:
         print(engine.report())
     """
 
-    def __init__(self, memory_path: str | None = None):
-        self.memory = GraphMemory(db_path=memory_path or "/tmp/neuroflow_memory.db")
+    def __init__(
+        self,
+        memory_path: str | None = None,
+        dispatch_fn: DispatchFn | None = None,
+    ):
+        self.memory = GraphMemory(
+            db_path=(
+                memory_path
+                or os.environ.get("NEUROFLOW_MEMORY_PATH")
+                or "/tmp/neuroflow_memory.db"
+            )
+        )
+        self._dispatch = dispatch_fn or self._default_dispatch
         self.agents: dict[str, AgentCard] = {}
         self.goal: str = ""
         self.dag = DAG()
@@ -332,6 +348,20 @@ class OSWEngine:
             "tasks_completed": 0,
             "tasks_failed": 0,
         }
+
+    def _default_dispatch(self, prompt: str) -> str:
+        """Run a prompt through the `hermes` CLI as a subprocess dispatch."""
+        cmd = [
+            "hermes",
+            "-p", "eni-worker",
+            "-z", prompt,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Dispatch failed (exit {result.returncode}): {result.stderr.strip()}"
+            )
+        return result.stdout.strip()
 
     def register_agent(self, card: AgentCard) -> None:
         self.agents[card.name] = card
@@ -383,9 +413,8 @@ class OSWEngine:
                 agent.state_machine.transition(AgentState.WORKING)
 
             try:
-                # For now tasks are stored in-memory.
-                # A real implementation would call an external agent.
-                result = f"Simulated execution: {node_data.get('prompt', '')[:60]}"
+                prompt = node_data.get("prompt", "")
+                result = self._dispatch(prompt)
                 self.results[node_id] = {"status": "ok", "output": result}
 
                 with self._lock:

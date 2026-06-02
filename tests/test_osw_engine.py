@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 
 from neuroflow_core.osw_engine import (
-    DAG,
-    CycleError,
-    Fact,
     GraphMemory,
-    StateMachine,
+    DAG,
+    AgentStateMachine,
     AgentState,
     AgentCard,
     OSWEngine,
+    CycleError,
+    Fact,
 )
 
 
@@ -332,11 +332,11 @@ class TestFact:
 
 
 # ======================================================================
-# StateMachine
+# StateMachine → renamed to AgentStateMachine
 # ======================================================================
 
 
-class TestStateMachine:
+class TestAgentStateMachine:
     def test_initial_state(self, state_machine):
         assert state_machine.state == AgentState.IDLE
 
@@ -477,22 +477,31 @@ class TestAgentCard:
 
 
 class TestOSWEngine:
+
+    @staticmethod
+    def _make_engine(**kwargs) -> OSWEngine:
+        kwargs.setdefault(
+            "dispatch_fn",
+            lambda p: f"Mock result for: {p[:60]}",
+        )
+        return OSWEngine(**kwargs)
+
     def test_register_agent(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         card = AgentCard(name="researcher")
         engine.register_agent(card)
         assert "researcher" in engine.agents
         assert engine.agents["researcher"] is card
 
     def test_ingest_goal(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         result = engine.ingest_goal("Test goal")
         assert engine.goal == "Test goal"
         assert "Goal accepted" in result
         assert engine.memory.recall("last_goal") == "Test goal"
 
     def test_decompose_auto(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Auto decompose")
         node_ids = engine.decompose()
         assert node_ids == ["root"]
@@ -500,7 +509,7 @@ class TestOSWEngine:
         assert engine.dag.nodes["root"]["prompt"] == "Auto decompose"
 
     def test_decompose_manual(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         tasks = [
             {"id": "research", "prompt": "Research topic", "depends_on": []},
             {"id": "write", "prompt": "Write report", "depends_on": ["research"]},
@@ -512,7 +521,7 @@ class TestOSWEngine:
         assert engine.dag.parents("write") == ["research"]
 
     def test_decompose_with_agents(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.register_agent(AgentCard(name="researcher"))
         tasks = [
             {"id": "task1", "prompt": "Do research", "agent": "researcher",
@@ -524,7 +533,7 @@ class TestOSWEngine:
         assert engine.dag.nodes["task1"]["priority"] == 5
 
     def test_execute_simple(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Do the thing")
         engine.decompose()
         results = engine.execute()
@@ -532,7 +541,7 @@ class TestOSWEngine:
         assert results["root"]["status"] == "ok"
 
     def test_execute_with_agent_state_transitions(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         card = AgentCard(name="worker")
         engine.register_agent(card)
         engine.ingest_goal("Work")
@@ -543,7 +552,7 @@ class TestOSWEngine:
         assert card.state_machine.state == AgentState.DONE
 
     def test_execute_maintains_order(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Ordered tasks")
         tasks = [
             {"id": "first", "prompt": "Step 1", "depends_on": []},
@@ -556,7 +565,7 @@ class TestOSWEngine:
         assert order == ["first", "second", "third"]
 
     def test_execute_cycle_error(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Cyclic")
         tasks = [
             {"id": "a", "prompt": "A", "depends_on": ["b"]},
@@ -568,7 +577,7 @@ class TestOSWEngine:
         assert "cycle" in results["error"].lower()
 
     def test_execute_memory_stores_results(self):
-        engine = OSWEngine(memory_path="/tmp/test_osw_memory.db")
+        engine = self._make_engine(memory_path="/tmp/test_osw_memory.db")
         try:
             engine.ingest_goal("Remember")
             engine.decompose()
@@ -580,7 +589,7 @@ class TestOSWEngine:
             engine.memory.clear()
 
     def test_report_structure(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Report test")
         engine.decompose()
         engine.execute()
@@ -595,14 +604,14 @@ class TestOSWEngine:
         assert report["dag"]["nodes"] == 1
 
     def test_report_before_execution(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         report = engine.report()
         assert report["goal"] == ""
         assert report["metrics"]["tasks_total"] == 0
         assert report["metrics"]["elapsed_seconds"] == 0
 
     def test_clear(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Clear me")
         engine.decompose([{"id": "t1", "prompt": "task", "depends_on": []}])
         engine.execute()
@@ -615,7 +624,7 @@ class TestOSWEngine:
         assert engine._metrics["tasks_failed"] == 0
 
     def test_multiple_agents(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.register_agent(AgentCard(name="researcher"))
         engine.register_agent(AgentCard(name="writer"))
         engine.ingest_goal("Multi-agent task")
@@ -631,7 +640,7 @@ class TestOSWEngine:
         assert engine.results["write"]["status"] == "ok"
 
     def test_execute_with_unknown_agent(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Unknown agent")
         tasks = [
             {"id": "t1", "prompt": "Task", "agent": "nonexistent", "depends_on": []},
@@ -641,7 +650,7 @@ class TestOSWEngine:
         assert results["t1"]["status"] == "ok"
 
     def test_memory_persistence(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("test")
         engine.decompose()
         engine.execute()
@@ -649,7 +658,7 @@ class TestOSWEngine:
         assert engine.memory.recall("task:root") is not None
 
     def test_execute_metrics(self):
-        engine = OSWEngine()
+        engine = self._make_engine()
         engine.ingest_goal("Metrics test")
         tasks = [
             {"id": "a", "prompt": "A", "depends_on": []},

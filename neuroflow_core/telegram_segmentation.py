@@ -8,6 +8,7 @@ not manual labelling.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -330,8 +331,10 @@ class TelegramSegmenter:
             "users": {str(uid): u.to_dict() for uid, u in self._users.items()},
         }
 
-    def export_json(self, path: str = "/tmp/telegram_segments.json") -> str:
-        """Dump the full snapshot to JSON. Returns the file path."""
+    def export_json(self, path: str = "") -> str:
+        """Dump the full snapshot to JSON. Default path uses $NEUROFLOW_SEGMENTS_PATH
+        env var or /tmp/telegram_segments.json."""
+        path = path or os.environ.get("NEUROFLOW_SEGMENTS_PATH", "/tmp/telegram_segments.json")
         with open(path, "w") as f:
             json.dump(self.export(), f, indent=2, ensure_ascii=False)
         return path

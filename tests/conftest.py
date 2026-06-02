@@ -14,7 +14,7 @@ from neuroflow_core.telegram_segmentation import (
     TRANSITIONS,
 )
 from neuroflow_core.telegram_ingestor import IngestorConfig
-from neuroflow_core.osw_engine import GraphMemory, DAG, StateMachine, AgentCard
+from neuroflow_core.osw_engine import GraphMemory, DAG, AgentStateMachine, AgentCard
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +77,8 @@ def memory(tmp_path: Path) -> Generator[GraphMemory, None, None]:
 
 
 @pytest.fixture
-def state_machine() -> StateMachine:
-    return StateMachine()
+def state_machine() -> AgentStateMachine:
+    return AgentStateMachine()
 
 
 @pytest.fixture

@@ -185,10 +185,13 @@ class TestClassifyMessage:
         result = ingestor._classify_message({"text": "Hello everyone"})
         assert result == "message"
 
-    def test_callback_query(self, ingestor_config):
+    def test_callback_query_handled_at_update_level(self, ingestor_config):
+        """Callback queries are handled by _process_update, not _classify_message."""
         ingestor = TelegramIngestor(ingestor_config)
-        result = ingestor._classify_message({"callback_query": {"data": "btn_1"}})
-        assert result == "reaction"
+        result = ingestor._classify_message(
+            {"callback_query": {"data": "btn_1"}}
+        )
+        assert result is None  # dead code removed — msg is not a real message
 
     def test_empty_message(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)

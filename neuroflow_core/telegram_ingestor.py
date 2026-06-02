@@ -22,9 +22,6 @@ import httpx
 
 from neuroflow_core.telegram_segmentation import (
     TelegramSegmenter,
-    UserState,
-    TRIGGER_MAP,
-    classify_trigger,
 )
 
 # ---------------------------------------------------------------------------
@@ -174,6 +171,162 @@ class UserStore:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard HTTP handler — explicit class, not closure
+# ---------------------------------------------------------------------------
+
+_SEGMENT_COLORS: dict[str, str] = {
+    "lead": "#6b7280", "active": "#3b82f6", "warm": "#f59e0b",
+    "hot": "#ef4444", "cold": "#8b5cf6", "churned": "#111827",
+    "banned": "#000000",
+}
+_SEGMENT_ORDER = ("lead", "active", "warm", "hot", "cold", "churned", "banned")
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the NeuroFlow REST API and HTML dashboard.
+
+    Bound to a ``store`` via class variable so it can serve data without
+    depending on a closure.
+    """
+
+    store: UserStore | None = None
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass  # quiet
+
+    # ------------------------------------------------------------------
+    # Response helpers
+    # ------------------------------------------------------------------
+
+    def _json_response(self, data: dict[str, Any], status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(json.dumps(data, indent=2, ensure_ascii=False).encode())
+
+    def _html_response(self, html_str: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(html_str.encode())
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        params = parse_qs(parsed.query)
+        store = self.store
+        if store is None:
+            self._json_response({"error": "store not available"}, 500)
+            return
+
+        if path in ("", "/dashboard"):
+            self._serve_dashboard(store)
+        elif path == "/api/segments":
+            self._json_response({
+                "total_users": store.total_users(),
+                "segments": store.segment_counts(),
+            })
+        elif path == "/api/events":
+            limit = int(params.get("limit", [50])[0])
+            self._json_response({"events": store.recent_events(limit)})
+        elif path.startswith("/api/user/"):
+            try:
+                uid = int(path.split("/")[-1])
+                user = store.get_user(uid)
+                if user:
+                    self._json_response({"user": user})
+                else:
+                    self._json_response({"error": "not found"}, 404)
+            except (ValueError, IndexError):
+                self._json_response({"error": "bad user_id"}, 400)
+        else:
+            self._json_response({"error": "not found"}, 404)
+
+    # ------------------------------------------------------------------
+    # Dashboard HTML
+    # ------------------------------------------------------------------
+
+    def _serve_dashboard(self, store: UserStore) -> None:
+        segments = store.segment_counts()
+        total = store.total_users()
+        events = store.recent_events(20)
+
+        rows = "".join(
+            f"<tr><td>{e.get('user_id', '?')}</td>"
+            f"<td>{html.escape(e.get('event_type', ''))}</td>"
+            f"<td>{html.escape(e.get('state_from', ''))}</td>"
+            f"<td>{html.escape(e.get('state_to', ''))}</td></tr>"
+            for e in events
+        )
+
+        seg_bars = ""
+        for seg_name in _SEGMENT_ORDER:
+            count = segments.get(seg_name, 0)
+            pct = (count / total * 100) if total > 0 else 0
+            seg_bars += (
+                f"<div style='margin:4px 0;display:flex;align-items:center;gap:8px'>"
+                f"<span style='width:70px;text-transform:capitalize'>{seg_name}</span>"
+                f"<div style='flex:1;height:20px;background:#e5e7eb;border-radius:4px;overflow:hidden'>"
+                f"<div style='width:{pct:.0f}%;height:100%;background:{_SEGMENT_COLORS.get(seg_name, '#999')};"
+                f"border-radius:4px;transition:width .5s'></div></div>"
+                f"<span style='width:50px;text-align:right'>{count}</span></div>"
+            )
+
+        html_page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NeuroFlow — Segment Dashboard</title>
+<style>
+body {{ font-family: -apple-system, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f9fafb; color: #111; }}
+.container {{ max-width: 900px; margin: 0 auto; }}
+h1 {{ font-size: 24px; margin-bottom: 4px; }}
+.subtitle {{ color: #6b7280; margin-bottom: 24px; }}
+.card {{ background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.1); padding: 20px; margin-bottom: 20px; }}
+.card h2 {{ margin: 0 0 12px; font-size: 18px; }}
+table {{ width: 100%; border-collapse: collapse; }}
+th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }}
+th {{ color: #6b7280; font-weight: 600; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #e5e7eb; }}
+.endpoint {{ font-family: monospace; font-size: 13px; background: #f3f4f6; padding: 6px 10px; border-radius: 4px; display: inline-block; }}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Segment Dashboard</h1>
+<p class="subtitle">Total users: <strong>{total}</strong></p>
+
+<div class="card">
+<h2>Segment distribution</h2>
+{seg_bars}
+</div>
+
+<div class="card">
+<h2>Recent events</h2>
+<table><thead><tr><th>User</th><th>Event</th><th>From</th><th>To</th></tr></thead>
+<tbody>{rows}</tbody></table>
+</div>
+
+<div class="card">
+<h2>API</h2>
+<div class="endpoint">GET /api/segments</div> — segment counts<br>
+<div class="endpoint">GET /api/events?limit=N</div> — recent events<br>
+<div class="endpoint">GET /api/user/&lt;id&gt;</div> — single user<br>
+</div>
+</div>
+</body>
+</html>"""
+        self._html_response(html_page)
+
+
+# ---------------------------------------------------------------------------
 # Ingestor
 # ---------------------------------------------------------------------------
 
@@ -294,159 +447,20 @@ class TelegramIngestor:
                    (".com", ".ru", ".org", ".net", "t.me", "https://", "http://")):
                 return "link"
             return "message"
-        if "callback_query" in msg:
-            return "reaction"
         return None
 
     # ------------------------------------------------------------------
     # HTTP server for REST API + dashboard
     # ------------------------------------------------------------------
 
-    def _make_handler(self) -> type[BaseHTTPRequestHandler]:
-        """Return a request handler class bound to this ingestor instance."""
-
-        ingestor = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format: str, *args: Any) -> None:
-                """Shut up the default logger — no request noise."""
-                pass  # quiet
-
-            def _json_response(self, data: dict[str, Any], status: int = 200) -> None:
-                """Send a JSON response with CORS headers."""
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(json.dumps(data, indent=2, ensure_ascii=False).encode())
-
-            def _html_response(self, html_str: str, status: int = 200) -> None:
-                """Send an HTML response with CORS headers."""
-                self.send_response(status)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.end_headers()
-                self.wfile.write(html_str.encode())
-
-            def do_GET(self) -> None:
-                """Route GET requests: dashboard, API, user lookup."""
-                parsed = urlparse(self.path)
-                path = parsed.path.rstrip("/")
-                params = parse_qs(parsed.query)
-
-                if path == "/":
-                    # The ingestor is imported from the segmenter module directly.
-                    # We reference the ingestor instance from the closure.
-                    pass
-
-                if path in ("", "/dashboard"):
-                    self._serve_dashboard()
-                elif path == "/api/segments":
-                    self._json_response({
-                        "total_users": ingestor.store.total_users(),
-                        "segments": ingestor.store.segment_counts(),
-                    })
-                elif path == "/api/events":
-                    limit = int(params.get("limit", [50])[0])
-                    self._json_response({"events": ingestor.store.recent_events(limit)})
-                elif path.startswith("/api/user/"):
-                    try:
-                        uid = int(path.split("/")[-1])
-                        user = ingestor.store.get_user(uid)
-                        if user:
-                            self._json_response({"user": user})
-                        else:
-                            self._json_response({"error": "not found"}, 404)
-                    except (ValueError, IndexError):
-                        self._json_response({"error": "bad user_id"}, 400)
-                else:
-                    self._json_response({"error": "not found"}, 404)
-
-            def _serve_dashboard(self) -> None:
-                """Render an HTML dashboard with segment distribution and recent events."""
-                segments = ingestor.store.segment_counts()
-                total = ingestor.store.total_users()
-                events = ingestor.store.recent_events(20)
-
-                rows = "".join(
-                    f"<tr><td>{e.get('user_id', '?')}</td>"
-                    f"<td>{html.escape(e.get('event_type', ''))}</td>"
-                    f"<td>{html.escape(e.get('state_from', ''))}</td>"
-                    f"<td>{html.escape(e.get('state_to', ''))}</td></tr>"
-                    for e in events
-                )
-
-                seg_bars = ""
-                colors = {
-                    "lead": "#6b7280", "active": "#3b82f6", "warm": "#f59e0b",
-                    "hot": "#ef4444", "cold": "#8b5cf6", "churned": "#111827",
-                    "banned": "#000000",
-                }
-                for seg_name in ("lead", "active", "warm", "hot", "cold", "churned", "banned"):
-                    count = segments.get(seg_name, 0)
-                    pct = (count / total * 100) if total > 0 else 0
-                    seg_bars += (
-                        f"<div style='margin:4px 0;display:flex;align-items:center;gap:8px'>"
-                        f"<span style='width:70px;text-transform:capitalize'>{seg_name}</span>"
-                        f"<div style='flex:1;height:20px;background:#e5e7eb;border-radius:4px;overflow:hidden'>"
-                        f"<div style='width:{pct:.0f}%;height:100%;background:{colors.get(seg_name, '#999')};"
-                        f"border-radius:4px;transition:width .5s'></div></div>"
-                        f"<span style='width:50px;text-align:right'>{count}</span></div>"
-                    )
-
-                html_page = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NeuroFlow — Segment Dashboard</title>
-<style>
-body {{ font-family: -apple-system, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f9fafb; color: #111; }}
-.container {{ max-width: 900px; margin: 0 auto; }}
-h1 {{ font-size: 24px; margin-bottom: 4px; }}
-.subtitle {{ color: #6b7280; margin-bottom: 24px; }}
-.card {{ background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,.1); padding: 20px; margin-bottom: 20px; }}
-.card h2 {{ margin: 0 0 12px; font-size: 18px; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }}
-th {{ color: #6b7280; font-weight: 600; }}
-.badge {{ display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #e5e7eb; }}
-.endpoint {{ font-family: monospace; font-size: 13px; background: #f3f4f6; padding: 6px 10px; border-radius: 4px; display: inline-block; }}
-</style>
-</head>
-<body>
-<div class="container">
-<h1>Segment Dashboard</h1>
-<p class="subtitle">Total users: <strong>{total}</strong></p>
-
-<div class="card">
-<h2>Segment distribution</h2>
-{seg_bars}
-</div>
-
-<div class="card">
-<h2>Recent events</h2>
-<table><thead><tr><th>User</th><th>Event</th><th>From</th><th>To</th></tr></thead>
-<tbody>{rows}</tbody></table>
-</div>
-
-<div class="card">
-<h2>API</h2>
-<div class="endpoint">GET /api/segments</div> — segment counts<br>
-<div class="endpoint">GET /api/events?limit=N</div> — recent events<br>
-<div class="endpoint">GET /api/user/&lt;id&gt;</div> — single user<br>
-</div>
-</div>
-</body>
-</html>"""
-                self._html_response(html_page)
-
-        return Handler
-
     def start(self) -> None:
         """Start polling and the HTTP server. Blocks forever."""
         self._running = True
-        server = HTTPServer(("0.0.0.0", self.config.http_port), self._make_handler())
+
+        # Wire the store into the handler class so it doesn't need a closure
+        DashboardHandler.store = self.store
+
+        server = HTTPServer(("0.0.0.0", self.config.http_port), DashboardHandler)
         poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         poll_thread.start()
 

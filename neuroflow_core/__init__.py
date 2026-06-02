@@ -21,9 +21,10 @@ from neuroflow_core.osw_engine import (
     OSWEngine,
     DAG,
     GraphMemory,
-    StateMachine,
+    AgentStateMachine,
     AgentCard,
     AgentState,
+    DispatchFn,
 )
 
 __all__ = [
@@ -39,7 +40,8 @@ __all__ = [
     "OSWEngine",
     "DAG",
     "GraphMemory",
-    "StateMachine",
+    "AgentStateMachine",
     "AgentCard",
     "AgentState",
+    "DispatchFn",
 ]
