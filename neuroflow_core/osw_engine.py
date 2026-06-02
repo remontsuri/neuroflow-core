@@ -1,0 +1,435 @@
+"""Takes a goal, splits it into a DAG of tasks, runs them, and gives you the results.
+
+This engine handles orchestration for multi-step agent workflows. Give it a
+high-level goal, it decomposes the work into a dependency graph, dispatches
+tasks to agents, and collects the output.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# DAG — dependency graph for task orchestration
+# ---------------------------------------------------------------------------
+
+
+class CycleError(ValueError):
+    """Raised when a cycle is detected in the DAG."""
+
+
+@dataclass
+class DAG:
+    """Minimal directed acyclic graph with topological sort.
+
+    Each node can carry arbitrary data. Edges represent dependencies —
+    a -> b means 'a must run before b'.
+    """
+
+    nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    edges: dict[str, set[str]] = field(default_factory=dict)
+
+    def add_node(self, node_id: str, **data: Any) -> None:
+        if node_id not in self.nodes:
+            self.nodes[node_id] = data
+            self.edges.setdefault(node_id, set())
+
+    def add_edge(self, from_node: str, to_node: str) -> None:
+        """from_node must complete before to_node starts."""
+        if from_node not in self.nodes:
+            self.add_node(from_node)
+        if to_node not in self.nodes:
+            self.add_node(to_node)
+        self.edges[from_node].add(to_node)
+
+    def parents(self, node_id: str) -> list[str]:
+        """Nodes that depend on node_id (reverse edges)."""
+        return [n for n, deps in self.edges.items() if node_id in deps]
+
+    def children(self, node_id: str) -> list[str]:
+        return list(self.edges.get(node_id, set()))
+
+    def ancestors(self, node_id: str) -> set[str]:
+        """All nodes that must run before node_id."""
+        result: set[str] = set()
+        stack = [node_id]
+        while stack:
+            n = stack.pop()
+            for p in self.parents(n):
+                if p not in result:
+                    result.add(p)
+                    stack.append(p)
+        return result
+
+    def topological_sort(self) -> list[str]:
+        """Kahn's algorithm. Raises CycleError if the graph has a cycle."""
+        in_degree = {n: 0 for n in self.nodes}
+        for deps in self.edges.values():
+            for d in deps:
+                in_degree[d] = in_degree.get(d, 0) + 1
+
+        queue = deque([n for n, deg in in_degree.items() if deg == 0])
+        sorted_nodes: list[str] = []
+
+        while queue:
+            n = queue.popleft()
+            sorted_nodes.append(n)
+            for child in self.edges.get(n, []):
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        if len(sorted_nodes) != len(self.nodes):
+            raise CycleError(
+                f"DAG has a cycle: sorted {len(sorted_nodes)}/{len(self.nodes)} nodes"
+            )
+        return sorted_nodes
+
+    def levels(self) -> list[list[str]]:
+        """Returns nodes grouped by dependency depth (parallel-ready layers)."""
+        sorted_nodes = self.topological_sort()
+        depth: dict[str, int] = {}
+        for n in sorted_nodes:
+            parent_depths = [depth.get(p, 0) for p in self.parents(n)]
+            depth[n] = max(parent_depths) + 1 if parent_depths else 0
+        max_depth = max(depth.values(), default=0)
+        layers: list[list[str]] = [[] for _ in range(max_depth + 1)]
+        for n, d in depth.items():
+            layers[d].append(n)
+        return layers
+
+
+# ---------------------------------------------------------------------------
+# GraphMemory — persistent state with trust scoring and decay
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Fact:
+    key: str
+    value: str
+    source: str = "system"
+    trust: float = 1.0
+    timestamp: float = field(default_factory=time.time)
+
+    def decay(self, halflife_days: float = 7.0) -> None:
+        elapsed_days = (time.time() - self.timestamp) / 86400
+        self.trust *= 0.5 ** (elapsed_days / halflife_days)
+
+    def __hash__(self) -> int:
+        return hash(self.key)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, Fact):
+            return NotImplemented
+        return self.key == other.key
+
+
+class GraphMemory:
+    """Memory store with SQLite persistence, trust scoring, and time decay.
+
+    Facts are key-value pairs tagged with a source and trust score. Query
+    results are filtered by trust; old/lazy facts sink below retrieval
+    thresholds.
+    """
+
+    def __init__(self, db_path: str = "/tmp/graph_memory.db"):
+        self._db_path = db_path
+        self._lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    source TEXT DEFAULT 'system',
+                    trust REAL DEFAULT 1.0,
+                    timestamp REAL DEFAULT (strftime('%s', 'now'))
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_facts_trust
+                ON facts(trust DESC)
+            """)
+
+    def remember(self, key: str, value: str, source: str = "system") -> None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO facts (key, value, source, trust, timestamp)
+                   VALUES (?, ?, ?, 1.0, ?)""",
+                (key, value, source, time.time()),
+            )
+
+    def recall(self, key: str) -> str | None:
+        with sqlite3.connect(self._db_path) as conn:
+            row = conn.execute(
+                "SELECT value, trust FROM facts WHERE key = ?", (key,)
+            ).fetchone()
+            if row and row[1] > 0.3:
+                return str(row[0])
+        return None
+
+    def search(self, query: str, min_trust: float = 0.3, limit: int = 10) -> list[Fact]:
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                """SELECT key, value, source, trust, timestamp FROM facts
+                   WHERE (key LIKE ? OR value LIKE ?) AND trust >= ?
+                   ORDER BY trust DESC LIMIT ?""",
+                (f"%{query}%", f"%{query}%", min_trust, limit),
+            ).fetchall()
+            return [Fact(key=r[0], value=r[1], source=r[2], trust=r[3], timestamp=r[4])
+                    for r in rows]
+
+    def forget(self, key: str) -> None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM facts WHERE key = ?", (key,))
+
+    def run_decay(self, halflife_days: float = 7.0) -> int:
+        """Reduce trust for all facts. Returns number of facts that fell below 0.3."""
+        with sqlite3.connect(self._db_path) as conn:
+            rows = conn.execute(
+                "SELECT key, trust, timestamp FROM facts"
+            ).fetchall()
+            pruned = 0
+            for key, trust, ts in rows:
+                elapsed_days = (time.time() - ts) / 86400
+                new_trust = trust * (0.5 ** (elapsed_days / halflife_days))
+                if new_trust < 0.3:
+                    conn.execute("DELETE FROM facts WHERE key = ?", (key,))
+                    pruned += 1
+                else:
+                    conn.execute(
+                        "UPDATE facts SET trust = ?, timestamp = ? WHERE key = ?",
+                        (new_trust, time.time(), key),
+                    )
+            return pruned
+
+    def clear(self) -> None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute("DELETE FROM facts")
+
+    def stats(self) -> dict[str, Any]:
+        with sqlite3.connect(self._db_path) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            avg_trust = conn.execute(
+                "SELECT AVG(trust) FROM facts"
+            ).fetchone()[0] or 0.0
+        return {"total_facts": total, "avg_trust": round(avg_trust, 3)}
+
+
+# ---------------------------------------------------------------------------
+# StateMachine — agent lifecycle manager
+# ---------------------------------------------------------------------------
+
+
+class AgentState(Enum):
+    IDLE = "idle"
+    WORKING = "working"
+    WAITING = "waiting"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class StateMachine:
+    """Manages agent lifecycle with allowed transitions.
+
+    Guards prevent invalid moves (e.g. IDLE -> FAILED without WORKING).
+    """
+
+    ALLOWED: dict[AgentState, set[AgentState]] = {
+        AgentState.IDLE: {AgentState.WORKING, AgentState.CANCELLED},
+        AgentState.WORKING: {AgentState.WAITING, AgentState.DONE, AgentState.FAILED},
+        AgentState.WAITING: {AgentState.WORKING, AgentState.CANCELLED},
+        AgentState.DONE: set(),
+        AgentState.FAILED: {AgentState.IDLE},
+        AgentState.CANCELLED: {AgentState.IDLE},
+    }
+
+    def __init__(self, initial: AgentState = AgentState.IDLE):
+        self._state = initial
+        self._lock = threading.Lock()
+
+    @property
+    def state(self) -> AgentState:
+        return self._state
+
+    def transition(self, target: AgentState) -> None:
+        with self._lock:
+            if target not in self.ALLOWED.get(self._state, set()):
+                raise ValueError(
+                    f"Cannot transition from {self._state.value} to {target.value}"
+                )
+            self._state = target
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state = AgentState.IDLE
+
+    def is_terminal(self) -> bool:
+        return self._state in (AgentState.DONE, AgentState.FAILED)
+
+
+# ---------------------------------------------------------------------------
+# AgentCard — lightweight agent registration
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AgentCard:
+    """Metadata for an agent that the OSW engine can dispatch to."""
+
+    name: str
+    role: str = "worker"
+    model: str = ""
+    tools: list[str] = field(default_factory=list)
+    max_retries: int = 3
+    timeout_s: int = 300
+    state_machine: StateMachine = field(default_factory=StateMachine)
+
+    def is_available(self) -> bool:
+        return self.state_machine.state == AgentState.IDLE
+
+
+# ---------------------------------------------------------------------------
+# OSWEngine — main orchestrator
+# ---------------------------------------------------------------------------
+
+
+class OSWEngine:
+    """Takes a goal, decomposes it into a task DAG, dispatches work, and
+    synthesises results.
+
+    Usage:
+
+        engine = OSWEngine()
+        engine.register_agent(AgentCard(name="researcher"))
+        result = engine.ingest_goal("Analyse user churn in Q2 2026")
+        engine.decompose()
+        engine.execute()
+        print(engine.report())
+    """
+
+    def __init__(self, memory_path: str | None = None):
+        self.memory = GraphMemory(db_path=memory_path or "/tmp/neuroflow_memory.db")
+        self.agents: dict[str, AgentCard] = {}
+        self.goal: str = ""
+        self.dag = DAG()
+        self.results: dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._metrics: dict[str, Any] = {
+            "started_at": 0.0,
+            "tasks_total": 0,
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+        }
+
+    def register_agent(self, card: AgentCard) -> None:
+        self.agents[card.name] = card
+
+    def ingest_goal(self, goal: str) -> str:
+        self.goal = goal
+        self._metrics["started_at"] = time.time()
+        self.memory.remember("last_goal", goal, source="user")
+        return f"Goal accepted: {goal}"
+
+    def decompose(self, tasks: list[dict[str, Any]] | None = None) -> list[str]:
+        """Build the task DAG. If tasks aren't provided the engine generates
+        them from the goal (default decomposition is a single root task)."""
+        with self._lock:
+            if tasks is None:
+                tasks = [{"id": "root", "prompt": self.goal, "depends_on": []}]
+
+            node_ids: list[str] = []
+            for t in tasks:
+                tid = t["id"]
+                self.dag.add_node(tid, prompt=t.get("prompt", ""),
+                                  agent=t.get("agent", ""),
+                                  priority=t.get("priority", 0))
+                for dep in t.get("depends_on", []):
+                    self.dag.add_edge(dep, tid)
+                node_ids.append(tid)
+
+            self._metrics["tasks_total"] = len(node_ids)
+            self.memory.remember("last_decomposition",
+                                 json.dumps(node_ids), source="system")
+            return node_ids
+
+    def execute(self) -> dict[str, Any]:
+        """Walk the DAG in topological order and execute each task.
+
+        Returns a dict of task_id -> result.
+        """
+        try:
+            order = self.dag.topological_sort()
+        except CycleError as e:
+            return {"error": str(e)}
+
+        for node_id in order:
+            node_data = self.dag.nodes.get(node_id, {})
+            agent_name = node_data.get("agent", "")
+
+            agent = self.agents.get(agent_name) if agent_name else None
+            if agent:
+                agent.state_machine.transition(AgentState.WORKING)
+
+            try:
+                # For now tasks are stored in-memory.
+                # A real implementation would call an external agent.
+                result = f"Simulated execution: {node_data.get('prompt', '')[:60]}"
+                self.results[node_id] = {"status": "ok", "output": result}
+
+                with self._lock:
+                    self._metrics["tasks_completed"] += 1
+
+                if agent:
+                    agent.state_machine.transition(AgentState.DONE)
+            except Exception as exc:
+                self.results[node_id] = {"status": "failed", "error": str(exc)}
+                with self._lock:
+                    self._metrics["tasks_failed"] += 1
+                if agent:
+                    agent.state_machine.transition(AgentState.FAILED)
+
+            self.memory.remember(f"task:{node_id}",
+                                 json.dumps(self.results[node_id]),
+                                 source="osw_engine")
+
+        return self.results
+
+    def report(self) -> dict[str, Any]:
+        elapsed = time.time() - self._metrics["started_at"] if self._metrics["started_at"] else 0
+        return {
+            "goal": self.goal,
+            "metrics": {
+                **self._metrics,
+                "elapsed_seconds": round(elapsed, 1),
+            },
+            "dag": {
+                "nodes": len(self.dag.nodes),
+                "edges": sum(len(d) for d in self.dag.edges.values()),
+            },
+            "results": self.results,
+        }
+
+    def clear(self) -> None:
+        self.goal = ""
+        self.dag = DAG()
+        self.results = {}
+        self._metrics = {
+            "started_at": 0.0,
+            "tasks_total": 0,
+            "tasks_completed": 0,
+            "tasks_failed": 0,
+        }

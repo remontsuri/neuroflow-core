@@ -1,37 +1,23 @@
+"""Telegram user state machine — tracks user lifecycle through messaging events.
+
+Instead of static tags (noob, engaged, churned), each user follows a state
+machine. Messages trigger transitions. Segments flow from current state,
+not manual labelling.
 """
-neuroflow-core :: Telegram State-Machine Segmenter
-Real-time user segmentation through state transitions.
 
-Concept:
-  Instead of static tags ("noob", "engaged", "churned"), each user
-  follows a state machine. Messages trigger transitions. Segments
-  are determined by current state, not manual labeling.
-
-States for Telegram marketing:
-  LEAD      → received welcome / joined
-  ACTIVE    → engaged with content (reacted, replied)
-  WARM      → clicked links, asked questions
-  HOT       → DMed, purchased, gave contact info
-  COLD      → no interaction for N days
-  CHURNED   → left / blocked / 30d silent
-  BANNED    → spam / rule violation
-
-Usage:
-  from state_machine import TelegramSegmenter, UserState
-  seg = TelegramSegmenter()
-  seg.process_message(user_id=42, msg_type="reaction")
-  print(seg.get_segment(42))
-"""
+from __future__ import annotations
 
 import json
-import time
 import threading
-from enum import Enum
+import time
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import Enum
+from typing import Any, Optional
 
 
 class UserState(Enum):
+    """Possible states for a Telegram user in the marketing funnel."""
+
     LEAD = "lead"
     ACTIVE = "active"
     WARM = "warm"
@@ -56,6 +42,8 @@ class UserState(Enum):
 
 
 class Trigger(Enum):
+    """Events that can transition a user from one state to another."""
+
     JOINED = "joined"
     VIEWED = "viewed"
     REACTED = "reacted"
@@ -74,9 +62,9 @@ class Trigger(Enum):
     BANNED_USER = "banned_user"
 
 
-# Transition table: (current_state, trigger) -> new_state
+# (current_state, trigger) -> new_state
 TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
-    # LEAD transitions
+    # LEAD
     (UserState.LEAD, Trigger.VIEWED): UserState.ACTIVE,
     (UserState.LEAD, Trigger.REACTED): UserState.ACTIVE,
     (UserState.LEAD, Trigger.REPLIED): UserState.WARM,
@@ -86,8 +74,7 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
     (UserState.LEAD, Trigger.SILENT_30D): UserState.CHURNED,
     (UserState.LEAD, Trigger.LEFT): UserState.CHURNED,
     (UserState.LEAD, Trigger.SPAM): UserState.BANNED,
-
-    # ACTIVE transitions
+    # ACTIVE
     (UserState.ACTIVE, Trigger.REACTED): UserState.ACTIVE,
     (UserState.ACTIVE, Trigger.REPLIED): UserState.WARM,
     (UserState.ACTIVE, Trigger.ASKED_QUESTION): UserState.WARM,
@@ -97,8 +84,7 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
     (UserState.ACTIVE, Trigger.SILENT_7D): UserState.COLD,
     (UserState.ACTIVE, Trigger.LEFT): UserState.CHURNED,
     (UserState.ACTIVE, Trigger.SPAM): UserState.BANNED,
-
-    # WARM transitions
+    # WARM
     (UserState.WARM, Trigger.REACTED): UserState.WARM,
     (UserState.WARM, Trigger.REPLIED): UserState.WARM,
     (UserState.WARM, Trigger.ASKED_QUESTION): UserState.WARM,
@@ -109,8 +95,7 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
     (UserState.WARM, Trigger.SILENT_7D): UserState.COLD,
     (UserState.WARM, Trigger.LEFT): UserState.CHURNED,
     (UserState.WARM, Trigger.BANNED_USER): UserState.BANNED,
-
-    # HOT transitions
+    # HOT
     (UserState.HOT, Trigger.PURCHASED): UserState.HOT,
     (UserState.HOT, Trigger.REPLIED): UserState.HOT,
     (UserState.HOT, Trigger.DM_SENT): UserState.HOT,
@@ -119,8 +104,7 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
     (UserState.HOT, Trigger.SILENT_30D): UserState.CHURNED,
     (UserState.HOT, Trigger.MANUAL_DEMOTE): UserState.ACTIVE,
     (UserState.HOT, Trigger.LEFT): UserState.CHURNED,
-
-    # COLD transitions
+    # COLD
     (UserState.COLD, Trigger.VIEWED): UserState.ACTIVE,
     (UserState.COLD, Trigger.REACTED): UserState.ACTIVE,
     (UserState.COLD, Trigger.REPLIED): UserState.WARM,
@@ -130,8 +114,7 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
     (UserState.COLD, Trigger.LEFT): UserState.CHURNED,
     (UserState.COLD, Trigger.SPAM): UserState.BANNED,
     (UserState.COLD, Trigger.MANUAL_PROMOTE): UserState.ACTIVE,
-
-    # CHURNED transitions (re-engagement)
+    # CHURNED (re-engagement)
     (UserState.CHURNED, Trigger.VIEWED): UserState.ACTIVE,
     (UserState.CHURNED, Trigger.REACTED): UserState.ACTIVE,
     (UserState.CHURNED, Trigger.REPLIED): UserState.WARM,
@@ -141,6 +124,8 @@ TRANSITIONS: dict[tuple[UserState, Trigger], UserState] = {
 
 @dataclass
 class UserProfile:
+    """Stores state and metrics for a single Telegram user."""
+
     user_id: int
     state: UserState = UserState.LEAD
     username: str = ""
@@ -150,12 +135,12 @@ class UserProfile:
     reactions_received: int = 0
     dm_count: int = 0
     tags: list[str] = field(default_factory=list)
-    history: list[dict] = field(default_factory=list)
+    history: list[dict[str, Any]] = field(default_factory=list)
 
     def to_segment(self) -> str:
         return self.state.value
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "user_id": self.user_id,
             "segment": self.state.value,
@@ -170,11 +155,63 @@ class UserProfile:
         }
 
 
-class TelegramSegmenter:
-    """Thread-safe state machine segmenter for Telegram users."""
+TRIGGER_MAP: dict[str, Trigger] = {
+    "join": Trigger.JOINED,
+    "joined": Trigger.JOINED,
+    "new_chat_member": Trigger.JOINED,
+    "view": Trigger.VIEWED,
+    "viewed": Trigger.VIEWED,
+    "read": Trigger.VIEWED,
+    "reaction": Trigger.REACTED,
+    "reacted": Trigger.REACTED,
+    "like": Trigger.REACTED,
+    "reply": Trigger.REPLIED,
+    "replied": Trigger.REPLIED,
+    "comment": Trigger.REPLIED,
+    "message": Trigger.REPLIED,
+    "link": Trigger.CLICKED_LINK,
+    "click": Trigger.CLICKED_LINK,
+    "clicked": Trigger.CLICKED_LINK,
+    "question": Trigger.ASKED_QUESTION,
+    "ask": Trigger.ASKED_QUESTION,
+    "dm": Trigger.DM_SENT,
+    "direct": Trigger.DM_SENT,
+    "purchase": Trigger.PURCHASED,
+    "bought": Trigger.PURCHASED,
+    "order": Trigger.PURCHASED,
+    "contact": Trigger.GAVE_CONTACT,
+    "phone": Trigger.GAVE_CONTACT,
+    "email": Trigger.GAVE_CONTACT,
+    "leave": Trigger.LEFT,
+    "left": Trigger.LEFT,
+    "kick": Trigger.LEFT,
+    "spam": Trigger.SPAM,
+    "ban": Trigger.BANNED_USER,
+    "banned": Trigger.BANNED_USER,
+    "silent_7d": Trigger.SILENT_7D,
+    "silent_30d": Trigger.SILENT_30D,
+}
 
-    def __init__(self, cold_threshold_days: int = 7,
-                 churn_threshold_days: int = 30):
+
+def classify_trigger(msg_type: str) -> Optional[Trigger]:
+    """Map a message type string to a Trigger enum.
+
+    Returns None if the type isn't recognised.
+    """
+    return TRIGGER_MAP.get(msg_type.lower())
+
+
+class TelegramSegmenter:
+    """Thread-safe state machine segmenter for Telegram users.
+
+    Usage:
+
+        seg = TelegramSegmenter()
+        seg.process_message(user_id=42, msg_type="reaction")
+        print(seg.get_segment(42))  # 'active'
+    """
+
+    def __init__(self, cold_threshold_days: int = 7, churn_threshold_days: int = 30) -> None:
         self._users: dict[int, UserProfile] = {}
         self._lock = threading.Lock()
         self._cold_threshold = cold_threshold_days * 86400
@@ -186,10 +223,15 @@ class TelegramSegmenter:
                 self._users[user_id] = UserProfile(user_id=user_id, username=username)
             return self._users[user_id]
 
-    def process_message(self, user_id: int, msg_type: str,
-                        username: str = "", metadata: dict | None = None) -> Optional[UserState]:
-        """Process a message event, apply transitions, return new state."""
-        trigger = self._classify_trigger(msg_type)
+    def process_message(
+        self,
+        user_id: int,
+        msg_type: str,
+        username: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> UserState | None:
+        """Classify an incoming event, transition the user's state, return the new state."""
+        trigger = classify_trigger(msg_type)
         if not trigger:
             return None
 
@@ -209,7 +251,6 @@ class TelegramSegmenter:
                 })
                 user.state = new_state
 
-                # Track DMs and reactions
                 if trigger == Trigger.DM_SENT:
                     user.dm_count += 1
                 if trigger in (Trigger.REACTED, Trigger.REPLIED):
@@ -217,15 +258,15 @@ class TelegramSegmenter:
 
         return user.state
 
-    def get_segment(self, user_id: int) -> Optional[str]:
+    def get_segment(self, user_id: int) -> str | None:
         user = self._users.get(user_id)
         return user.to_segment() if user else None
 
-    def get_user(self, user_id: int) -> Optional[UserProfile]:
+    def get_user(self, user_id: int) -> UserProfile | None:
         return self._users.get(user_id)
 
-    def run_decay(self):
-        """Periodic decay: move silent users to COLD/CHURNED."""
+    def run_decay(self) -> None:
+        """Move silent users to COLD or CHURNED based on inactivity thresholds."""
         now = time.time()
         with self._lock:
             for uid, user in list(self._users.items()):
@@ -233,13 +274,15 @@ class TelegramSegmenter:
                     continue
                 elapsed = now - user.last_active
                 if elapsed > self._churn_threshold and user.state != UserState.CHURNED:
-                    # Hard churn
                     self._apply_forced_transition(user, Trigger.SILENT_30D)
                 elif elapsed > self._cold_threshold and user.state not in (
-                        UserState.COLD, UserState.LEAD, UserState.CHURNED):
+                    UserState.COLD,
+                    UserState.LEAD,
+                    UserState.CHURNED,
+                ):
                     self._apply_forced_transition(user, Trigger.SILENT_7D)
 
-    def _apply_forced_transition(self, user: UserProfile, trigger: Trigger):
+    def _apply_forced_transition(self, user: UserProfile, trigger: Trigger) -> None:
         key = (user.state, trigger)
         new_state = TRANSITIONS.get(key)
         if new_state and new_state != user.state:
@@ -260,7 +303,7 @@ class TelegramSegmenter:
             return counts
 
     def hot_leads(self) -> list[UserProfile]:
-        """Users most likely to convert."""
+        """Users most likely to convert, sorted by priority."""
         with self._lock:
             return sorted(
                 [u for u in self._users.values() if u.state.is_convertible()],
@@ -268,46 +311,7 @@ class TelegramSegmenter:
                 reverse=True,
             )
 
-    def _classify_trigger(self, msg_type: str) -> Optional[Trigger]:
-        mapping = {
-            "join": Trigger.JOINED,
-            "joined": Trigger.JOINED,
-            "new_chat_member": Trigger.JOINED,
-            "view": Trigger.VIEWED,
-            "viewed": Trigger.VIEWED,
-            "read": Trigger.VIEWED,
-            "reaction": Trigger.REACTED,
-            "reacted": Trigger.REACTED,
-            "like": Trigger.REACTED,
-            "reply": Trigger.REPLIED,
-            "replied": Trigger.REPLIED,
-            "comment": Trigger.REPLIED,
-            "message": Trigger.REPLIED,
-            "link": Trigger.CLICKED_LINK,
-            "click": Trigger.CLICKED_LINK,
-            "clicked": Trigger.CLICKED_LINK,
-            "question": Trigger.ASKED_QUESTION,
-            "ask": Trigger.ASKED_QUESTION,
-            "dm": Trigger.DM_SENT,
-            "direct": Trigger.DM_SENT,
-            "purchase": Trigger.PURCHASED,
-            "bought": Trigger.PURCHASED,
-            "order": Trigger.PURCHASED,
-            "contact": Trigger.GAVE_CONTACT,
-            "phone": Trigger.GAVE_CONTACT,
-            "email": Trigger.GAVE_CONTACT,
-            "leave": Trigger.LEFT,
-            "left": Trigger.LEFT,
-            "kick": Trigger.LEFT,
-            "spam": Trigger.SPAM,
-            "ban": Trigger.BANNED_USER,
-            "banned": Trigger.BANNED_USER,
-            "silent_7d": Trigger.SILENT_7D,
-            "silent_30d": Trigger.SILENT_30D,
-        }
-        return mapping.get(msg_type.lower())
-
-    def export(self) -> dict:
+    def export(self) -> dict[str, Any]:
         return {
             "total_users": len(self._users),
             "segments": self.segment_counts(),
@@ -315,7 +319,7 @@ class TelegramSegmenter:
             "users": {str(uid): u.to_dict() for uid, u in self._users.items()},
         }
 
-    def export_json(self, path: str = "/tmp/telegram_segments.json"):
+    def export_json(self, path: str = "/tmp/telegram_segments.json") -> str:
         with open(path, "w") as f:
             json.dump(self.export(), f, indent=2, ensure_ascii=False)
         return path
