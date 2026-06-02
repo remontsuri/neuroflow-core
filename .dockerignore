@@ -15,4 +15,4 @@ docs/
 *.md
 ruff.toml
 mypy.ini
-pyproject.toml
+# Keep: pyproject.toml is needed by Dockerfile

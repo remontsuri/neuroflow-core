@@ -20,14 +20,16 @@ def _setup_logging() -> None:
 
 
 def main() -> None:
-    """Entry point: prints config summary for CLI invocation."""
+    """Entry point: start the ingestor (poller + HTTP server)."""
     _setup_logging()
     config = config_from_env()
-    logging.getLogger(__name__).info(
-        "Starting ingestor (poll_interval=%ds)", config.poll_interval_s
-    )
-    # TelegramIngestor is started by Hermes gateway — this CLI is a stub
-    # for future `neuroflow run` / `neuroflow ingest` / `neuroflow export`.
+
+    from neuroflow_core.telegram_ingestor import TelegramIngestor  # noqa: PLC0415
+
+    ingestor = TelegramIngestor(config)
+    logger = logging.getLogger(__name__)
+    logger.info("Starting ingestor (poll_interval=%ds)", config.poll_interval_s)
+    ingestor.start()
 
 
 if __name__ == "__main__":
