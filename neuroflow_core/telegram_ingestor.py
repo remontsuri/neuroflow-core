@@ -1,8 +1,8 @@
-"""Telegram ingestor — polls Telegram channels and segments users by state.
+"""Polls Telegram channels, classifies people into segments, serves a dashboard.
 
-Runs a background poller that pulls messages from Telegram groups/channels
-and feeds them into the state machine segmenter. Also serves a REST API
-and a minimal dashboard.
+Background poller pulls messages from Telegram groups/channels, feeds them
+into the state-machine segmenter, and logs everything to SQLite. Also runs
+a REST API + a minimal HTML dashboard so you can see what's happening.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from neuroflow_core.telegram_segmentation import (
 
 @dataclass
 class IngestorConfig:
-    """Runtime configuration for the Telegram ingestor."""
+    """What the ingestor needs to run — bot token, API base, port, thresholds."""
 
     bot_token: str
     api_base: str = "https://api.telegram.org"
@@ -47,9 +47,10 @@ class IngestorConfig:
 
 
 def config_from_env() -> IngestorConfig:
-    """Load configuration from environment variables.
+    """Read config from environment variables.
 
-    TELEGRAM_BOT_TOKEN is required. Everything else has defaults.
+    TELEGRAM_BOT_TOKEN is mandatory. Falls back to reading /opt/data/.env
+    line-by-line if the env var isn't set.
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
     if not token:
@@ -72,13 +73,14 @@ def config_from_env() -> IngestorConfig:
 
 
 class UserStore:
-    """SQLite-backed store for user profiles and events."""
+    """SQLite store for user profiles and events. Thread-safe-ish (SQLite handles the locking)."""
 
     def __init__(self, db_path: str):
         self._db_path = db_path
         self._init_db()
 
     def _init_db(self) -> None:
+        """Create the tables if they don't exist yet."""
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             conn.executescript("""
@@ -108,6 +110,7 @@ class UserStore:
 
     def upsert_user(self, user_id: int, state: str, username: str = "",
                     message_count: int = 0, tags: list[str] | None = None) -> None:
+        """Insert or update a user record."""
         now = time.time()
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("""
@@ -123,6 +126,7 @@ class UserStore:
                   json.dumps(tags or [])))
 
     def get_user(self, user_id: int) -> dict[str, Any] | None:
+        """Look up a user by ID. Returns None if not found."""
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -135,6 +139,7 @@ class UserStore:
     def log_event(self, user_id: int, event_type: str,
                   state_from: str = "", state_to: str = "",
                   metadata: dict[str, Any] | None = None) -> None:
+        """Record an event in the event log."""
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("""
                 INSERT INTO events (user_id, event_type, state_from, state_to, metadata, created_at)
@@ -143,6 +148,7 @@ class UserStore:
                   json.dumps(metadata or {}), time.time()))
 
     def segment_counts(self) -> dict[str, int]:
+        """How many users are in each segment right now."""
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
                 "SELECT state, COUNT(*) as cnt FROM users GROUP BY state"
@@ -150,6 +156,7 @@ class UserStore:
             return {row[0]: row[1] for row in rows}
 
     def recent_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Most recent events, newest first."""
         with sqlite3.connect(self._db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -158,6 +165,7 @@ class UserStore:
             return [dict(r) for r in rows]
 
     def total_users(self) -> int:
+        """Total user count across all segments."""
         with sqlite3.connect(self._db_path) as conn:
             result: int | None = conn.execute(
                 "SELECT COUNT(*) FROM users"
@@ -171,15 +179,15 @@ class UserStore:
 
 
 class TelegramIngestor:
-    """Polls Telegram channels, segments users, and serves a REST API.
+    """The main thing — polls Telegram, segments users, serves a REST API.
 
-    Usage:
         config = IngestorConfig(bot_token="123:abc")
         ingestor = TelegramIngestor(config)
-        ingestor.start()  # blocks
+        ingestor.start()  # blocks forever
     """
 
     def __init__(self, config: IngestorConfig):
+        """Wire up the ingestor: segmenter, user store, HTTP client."""
         self.config = config
         self.segmenter = TelegramSegmenter(
             cold_threshold_days=config.cold_days,
@@ -193,6 +201,7 @@ class TelegramIngestor:
 
     @property
     def client(self) -> httpx.Client:
+        """Lazy HTTP client — one per lifetime."""
         if self._http_client is None:
             self._http_client = httpx.Client(
                 base_url=self.config.api_base,
@@ -230,6 +239,7 @@ class TelegramIngestor:
         return len(updates)
 
     def _process_update(self, update: dict[str, Any]) -> None:
+        """Route one update through segmentation and logging."""
         msg = update.get("message") or update.get("callback_query", {}).get("message")
         if not msg:
             return
@@ -299,9 +309,11 @@ class TelegramIngestor:
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: Any) -> None:
+                """Shut up the default logger — no request noise."""
                 pass  # quiet
 
             def _json_response(self, data: dict[str, Any], status: int = 200) -> None:
+                """Send a JSON response with CORS headers."""
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -309,6 +321,7 @@ class TelegramIngestor:
                 self.wfile.write(json.dumps(data, indent=2, ensure_ascii=False).encode())
 
             def _html_response(self, html_str: str, status: int = 200) -> None:
+                """Send an HTML response with CORS headers."""
                 self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Access-Control-Allow-Origin", "*")
@@ -316,6 +329,7 @@ class TelegramIngestor:
                 self.wfile.write(html_str.encode())
 
             def do_GET(self) -> None:
+                """Route GET requests: dashboard, API, user lookup."""
                 parsed = urlparse(self.path)
                 path = parsed.path.rstrip("/")
                 params = parse_qs(parsed.query)
@@ -349,6 +363,7 @@ class TelegramIngestor:
                     self._json_response({"error": "not found"}, 404)
 
             def _serve_dashboard(self) -> None:
+                """Render an HTML dashboard with segment distribution and recent events."""
                 segments = ingestor.store.segment_counts()
                 total = ingestor.store.total_users()
                 events = ingestor.store.recent_events(20)
@@ -443,6 +458,7 @@ th {{ color: #6b7280; font-weight: 600; }}
             server.shutdown()
 
     def _poll_loop(self) -> None:
+        """Poll Telegram in a loop until told to stop."""
         while self._running:
             count = self.poll_once()
             if count:
@@ -450,4 +466,5 @@ th {{ color: #6b7280; font-weight: 600; }}
             time.sleep(self.config.poll_interval_s)
 
     def stop(self) -> None:
+        """Shut down the polling loop gracefully."""
         self._running = False

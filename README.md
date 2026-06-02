@@ -429,4 +429,4 @@ mypy neuroflow_core
 
 ## License
 
-MIT © 2026 Vladislav. See [LICENSE](./LICENSE).
+MIT © 2026 remontsuri. See [LICENSE](./LICENSE).

@@ -5,11 +5,11 @@ build-backend = "setuptools.backends._legacy:_Backend"
 [project]
 name = "neuroflow-core"
 version = "0.1.0"
-description = "Telegram user segmentation engine with state-machine workflows"
+description = "Telegram user segmentation with state machines — track, classify, and convert users through custom pipelines"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "Vladislav", email = "remontsuri@gmail.com" }
+    { name = "remontsuri", email = "remontsuri@gmail.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [

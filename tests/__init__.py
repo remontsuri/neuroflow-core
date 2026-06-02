@@ -1,1 +1,1 @@
-"""NeuroFlow Core — pytest test suite."""
+"""Tests for neuroflow-core — segmentation, ingestor, OSW engine."""

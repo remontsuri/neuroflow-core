@@ -27,9 +27,11 @@ class UserState(Enum):
     BANNED = "banned"
 
     def is_convertible(self) -> bool:
+        """WARM and HOT users are worth chasing."""
         return self in (UserState.WARM, UserState.HOT)
 
     def priority_score(self) -> int:
+        """Higher score = higher value lead. HOT=100, BANNED=-1."""
         return {
             UserState.HOT: 100,
             UserState.WARM: 70,
@@ -138,9 +140,11 @@ class UserProfile:
     history: list[dict[str, Any]] = field(default_factory=list)
 
     def to_segment(self) -> str:
+        """Shortcut: get the segment label."""
         return self.state.value
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialise the user profile for API responses."""
         return {
             "user_id": self.user_id,
             "segment": self.state.value,
@@ -212,12 +216,14 @@ class TelegramSegmenter:
     """
 
     def __init__(self, cold_threshold_days: int = 7, churn_threshold_days: int = 30) -> None:
+        """Set up the segmenter: in-memory user dict, thresholds in days."""
         self._users: dict[int, UserProfile] = {}
         self._lock = threading.Lock()
         self._cold_threshold = cold_threshold_days * 86400
         self._churn_threshold = churn_threshold_days * 86400
 
     def get_or_create(self, user_id: int, username: str = "") -> UserProfile:
+        """Get a user profile or create one if it doesn't exist yet."""
         with self._lock:
             if user_id not in self._users:
                 self._users[user_id] = UserProfile(user_id=user_id, username=username)
@@ -259,10 +265,12 @@ class TelegramSegmenter:
         return user.state
 
     def get_segment(self, user_id: int) -> str | None:
+        """Get a user's current segment label, or None if unknown."""
         user = self._users.get(user_id)
         return user.to_segment() if user else None
 
     def get_user(self, user_id: int) -> UserProfile | None:
+        """Get a user profile, or None if not seen before."""
         return self._users.get(user_id)
 
     def run_decay(self) -> None:
@@ -283,6 +291,7 @@ class TelegramSegmenter:
                     self._apply_forced_transition(user, Trigger.SILENT_7D)
 
     def _apply_forced_transition(self, user: UserProfile, trigger: Trigger) -> None:
+        """Move a user to a new state without an external event (e.g. decay)."""
         key = (user.state, trigger)
         new_state = TRANSITIONS.get(key)
         if new_state and new_state != user.state:
@@ -295,6 +304,7 @@ class TelegramSegmenter:
             user.state = new_state
 
     def segment_counts(self) -> dict[str, int]:
+        """Count users in each segment, under the lock."""
         with self._lock:
             counts: dict[str, int] = {}
             for u in self._users.values():
@@ -312,6 +322,7 @@ class TelegramSegmenter:
             )
 
     def export(self) -> dict[str, Any]:
+        """Full snapshot: all users, segments, counts."""
         return {
             "total_users": len(self._users),
             "segments": self.segment_counts(),
@@ -320,6 +331,7 @@ class TelegramSegmenter:
         }
 
     def export_json(self, path: str = "/tmp/telegram_segments.json") -> str:
+        """Dump the full snapshot to JSON. Returns the file path."""
         with open(path, "w") as f:
             json.dump(self.export(), f, indent=2, ensure_ascii=False)
         return path

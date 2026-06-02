@@ -29,10 +29,10 @@ class CycleError(ValueError):
 
 @dataclass
 class DAG:
-    """Minimal directed acyclic graph with topological sort.
+    """A directed acyclic graph with topological sort.
 
-    Each node can carry arbitrary data. Edges represent dependencies —
-    a -> b means 'a must run before b'.
+    Each node carries whatever data you need. An edge a → b means 'a must
+    finish before b starts'.
     """
 
     nodes: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -52,7 +52,7 @@ class DAG:
         self.edges[from_node].add(to_node)
 
     def parents(self, node_id: str) -> list[str]:
-        """Nodes that depend on node_id (reverse edges)."""
+        """Tasks this node depends on (reverse edge lookup)."""
         return [n for n, deps in self.edges.items() if node_id in deps]
 
     def children(self, node_id: str) -> list[str]:
@@ -71,7 +71,7 @@ class DAG:
         return result
 
     def topological_sort(self) -> list[str]:
-        """Kahn's algorithm. Raises CycleError if the graph has a cycle."""
+        """Kahn's algorithm — raises CycleError if there's a loop."""
         in_degree = {n: 0 for n in self.nodes}
         for deps in self.edges.values():
             for d in deps:
@@ -95,7 +95,7 @@ class DAG:
         return sorted_nodes
 
     def levels(self) -> list[list[str]]:
-        """Returns nodes grouped by dependency depth (parallel-ready layers)."""
+        """Group nodes by dependency depth — nodes at the same level can run in parallel."""
         sorted_nodes = self.topological_sort()
         depth: dict[str, int] = {}
         for n in sorted_nodes:
@@ -135,11 +135,11 @@ class Fact:
 
 
 class GraphMemory:
-    """Memory store with SQLite persistence, trust scoring, and time decay.
+    """Persistent key-value store with trust scores that decay over time.
 
-    Facts are key-value pairs tagged with a source and trust score. Query
-    results are filtered by trust; old/lazy facts sink below retrieval
-    thresholds.
+    Facts have a source and a trust score. Queries filter by trust — old
+    or rarely-accessed facts naturally sink below the retrieval threshold
+    and get pruned.
     """
 
     def __init__(self, db_path: str = "/tmp/graph_memory.db"):
@@ -196,7 +196,7 @@ class GraphMemory:
             conn.execute("DELETE FROM facts WHERE key = ?", (key,))
 
     def run_decay(self, halflife_days: float = 7.0) -> int:
-        """Reduce trust for all facts. Returns number of facts that fell below 0.3."""
+        """Lower trust for every fact. Returns how many dropped below 0.3 and were pruned."""
         with sqlite3.connect(self._db_path) as conn:
             rows = conn.execute(
                 "SELECT key, trust, timestamp FROM facts"
@@ -243,9 +243,10 @@ class AgentState(Enum):
 
 
 class StateMachine:
-    """Manages agent lifecycle with allowed transitions.
+    """Agent lifecycle state machine with guarded transitions.
 
-    Guards prevent invalid moves (e.g. IDLE -> FAILED without WORKING).
+    Tries to go IDLE → FAILED directly? Nope — that's not in the allowed
+    table and it'll raise.
     """
 
     ALLOWED: dict[AgentState, set[AgentState]] = {
@@ -288,7 +289,7 @@ class StateMachine:
 
 @dataclass
 class AgentCard:
-    """Metadata for an agent that the OSW engine can dispatch to."""
+    """Agent registration metadata — name, role, model, state."""
 
     name: str
     role: str = "worker"
@@ -308,14 +309,11 @@ class AgentCard:
 
 
 class OSWEngine:
-    """Takes a goal, decomposes it into a task DAG, dispatches work, and
-    synthesises results.
-
-    Usage:
+    """The orchestrator — give it a goal, it builds a task DAG and runs the whole thing.
 
         engine = OSWEngine()
         engine.register_agent(AgentCard(name="researcher"))
-        result = engine.ingest_goal("Analyse user churn in Q2 2026")
+        engine.ingest_goal("Analyse user churn in Q2 2026")
         engine.decompose()
         engine.execute()
         print(engine.report())
@@ -345,8 +343,11 @@ class OSWEngine:
         return f"Goal accepted: {goal}"
 
     def decompose(self, tasks: list[dict[str, Any]] | None = None) -> list[str]:
-        """Build the task DAG. If tasks aren't provided the engine generates
-        them from the goal (default decomposition is a single root task)."""
+        """Turn the goal (or explicit tasks) into a DAG.
+
+        If no tasks are provided, it creates a single root task from the
+        goal string.
+        """
         with self._lock:
             if tasks is None:
                 tasks = [{"id": "root", "prompt": self.goal, "depends_on": []}]
@@ -367,10 +368,7 @@ class OSWEngine:
             return node_ids
 
     def execute(self) -> dict[str, Any]:
-        """Walk the DAG in topological order and execute each task.
-
-        Returns a dict of task_id -> result.
-        """
+        """Walk the DAG topologically and run each task. Returns {task_id: result}."""
         try:
             order = self.dag.topological_sort()
         except CycleError as e:
@@ -409,6 +407,7 @@ class OSWEngine:
         return self.results
 
     def report(self) -> dict[str, Any]:
+        """Package up everything — goal, metrics, DAG stats, and per-task results."""
         elapsed = time.time() - self._metrics["started_at"] if self._metrics["started_at"] else 0
         return {
             "goal": self.goal,
@@ -424,6 +423,7 @@ class OSWEngine:
         }
 
     def clear(self) -> None:
+        """Reset everything — goal, DAG, results, metrics."""
         self.goal = ""
         self.dag = DAG()
         self.results = {}
