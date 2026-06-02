@@ -278,7 +278,7 @@ class TelegramSegmenter:
         """Move silent users to COLD or CHURNED based on inactivity thresholds."""
         now = time.time()
         with self._lock:
-            for uid, user in list(self._users.items()):
+            for user in list(self._users.values()):
                 if user.state in (UserState.BANNED, UserState.CHURNED):
                     continue
                 elapsed = now - user.last_active

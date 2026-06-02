@@ -7,6 +7,7 @@ from neuroflow_core.telegram_ingestor import config_from_env
 
 
 def main() -> None:
+    """Entry point: prints config summary for CLI invocation."""
     config = config_from_env()
     print(f"[neuroflow] Starting ingestor (poll_interval={config.poll_interval_s}s)")
     # TelegramIngestor is started by Hermes gateway — this CLI is a stub

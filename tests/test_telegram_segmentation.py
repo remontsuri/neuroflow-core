@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 from neuroflow_core.telegram_segmentation import (
-    TelegramSegmenter,
     UserProfile,
     UserState,
     Trigger,

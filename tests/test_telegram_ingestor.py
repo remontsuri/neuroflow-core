@@ -1,10 +1,8 @@
 """Tests for telegram_ingestor — config, message classification, polling."""
 
-import json
 import os
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

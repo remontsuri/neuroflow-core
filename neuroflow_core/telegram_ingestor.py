@@ -61,7 +61,8 @@ def config_from_env() -> IngestorConfig:
                         token = line.split("=", 1)[1]
                         break
 
-    return IngestorConfig(bot_token=token)
+    db_path = os.environ.get("NEUROFLOW_INGESTOR_DB_PATH", "/tmp/telegram_ingestor.db")
+    return IngestorConfig(bot_token=token, db_path=db_path)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +192,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     store: UserStore | None = None
 
+    def _check_auth(self) -> bool:
+        """Validate X-API-Key header against NEUROFLOW_API_KEY env var, or allow all if unset."""
+        expected = os.environ.get("NEUROFLOW_API_KEY", "")
+        if not expected:
+            return True
+        return self.headers.get("X-API-Key", "") == expected
+
+    def _unauthorized(self) -> None:
+        self.send_response(401)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Unauthorized")
+
     def log_message(self, format: str, *args: Any) -> None:
         pass  # quiet
 
@@ -217,6 +231,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:
+        if not self._check_auth():
+            return self._unauthorized()
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)

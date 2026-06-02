@@ -354,9 +354,8 @@ class OSWEngine:
         cmd = [
             "hermes",
             "-p", "eni-worker",
-            "-z", prompt,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             raise RuntimeError(
                 f"Dispatch failed (exit {result.returncode}): {result.stderr.strip()}"
