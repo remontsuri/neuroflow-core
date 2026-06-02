@@ -206,6 +206,21 @@ def classify_trigger(msg_type: str) -> Optional[Trigger]:
     return TRIGGER_MAP.get(msg_type.lower())
 
 
+@dataclass
+class TelegramEvent:
+    """Typed event for the Input contract — carries a resolved Trigger, not a raw string.
+
+    Build this in your caller (TelegramIngestor, webhook, test) and pass it
+    to TelegramSegmenter.process_event() for type-safe processing.
+    """
+
+    user_id: int
+    trigger: Trigger
+    username: str = ""
+    metadata: dict[str, Any] | None = None
+    timestamp: float = field(default_factory=time.time)
+
+
 class TelegramSegmenter:
     """Thread-safe state machine segmenter for Telegram users.
 
@@ -230,6 +245,35 @@ class TelegramSegmenter:
                 self._users[user_id] = UserProfile(user_id=user_id, username=username)
             return self._users[user_id]
 
+    def process_event(self, event: TelegramEvent) -> UserState | None:
+        """Process a typed TelegramEvent — the primary entry point for the Input contract.
+
+        Uses the pre-resolved Trigger directly, no string classification.
+        Returns the user's new state, or None if the transition was a no-op.
+        """
+        user = self.get_or_create(event.user_id, event.username)
+        user.last_active = time.time()
+        user.message_count += 1
+
+        with self._lock:
+            key = (user.state, event.trigger)
+            new_state = TRANSITIONS.get(key)
+            if new_state and new_state != user.state:
+                user.history.append({
+                    "from": user.state.value,
+                    "to": new_state.value,
+                    "trigger": event.trigger.value,
+                    "ts": time.time(),
+                })
+                user.state = new_state
+
+                if event.trigger == Trigger.DM_SENT:
+                    user.dm_count += 1
+                if event.trigger in (Trigger.REACTED, Trigger.REPLIED):
+                    user.reactions_received += 1
+
+        return user.state
+
     def process_message(
         self,
         user_id: int,
@@ -237,33 +281,18 @@ class TelegramSegmenter:
         username: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> UserState | None:
-        """Classify an incoming event, transition the user's state, return the new state."""
+        """String-based convenience wrapper — resolves msg_type to Trigger
+        and delegates to process_event(). Prefer process_event() for new code.
+        """
         trigger = classify_trigger(msg_type)
         if not trigger:
             return None
-
-        user = self.get_or_create(user_id, username)
-        user.last_active = time.time()
-        user.message_count += 1
-
-        with self._lock:
-            key = (user.state, trigger)
-            new_state = TRANSITIONS.get(key)
-            if new_state and new_state != user.state:
-                user.history.append({
-                    "from": user.state.value,
-                    "to": new_state.value,
-                    "trigger": trigger.value,
-                    "ts": time.time(),
-                })
-                user.state = new_state
-
-                if trigger == Trigger.DM_SENT:
-                    user.dm_count += 1
-                if trigger in (Trigger.REACTED, Trigger.REPLIED):
-                    user.reactions_received += 1
-
-        return user.state
+        return self.process_event(TelegramEvent(
+            user_id=user_id,
+            trigger=trigger,
+            username=username,
+            metadata=metadata,
+        ))
 
     def get_segment(self, user_id: int) -> str | None:
         """Get a user's current segment label, or None if unknown."""

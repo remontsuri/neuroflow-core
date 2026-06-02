@@ -22,6 +22,58 @@ DispatchFn = Callable[[str], str]
 
 
 # ---------------------------------------------------------------------------
+# DispatcherRegistry — pluggable named dispatch strategies
+# ---------------------------------------------------------------------------
+
+
+class DispatcherRegistry:
+    """Pluggable dispatch registry — register named dispatchers, pick one.
+
+    Usage::
+
+        reg = DispatcherRegistry()
+        reg.register("hermes-cli", my_hermes_dispatch, default=True)
+        reg.register("mock", lambda p: f"mock:{p}")
+        result = reg.dispatch("some prompt")           # uses default
+        result = reg.dispatch("some prompt", name="mock")  # explicit
+    """
+
+    def __init__(self) -> None:
+        self._dispatchers: dict[str, DispatchFn] = {}
+        self._default_name: str = ""
+
+    def register(self, name: str, fn: DispatchFn, *, default: bool = False) -> None:
+        """Register a dispatcher by name. Pass ``default=True`` to make it the default."""
+        self._dispatchers[name] = fn
+        if default or not self._default_name:
+            self._default_name = name
+
+    @property
+    def default_name(self) -> str:
+        return self._default_name
+
+    def list(self) -> list[str]:
+        """Return all registered dispatcher names."""
+        return list(self._dispatchers.keys())
+
+    def get(self, name: str) -> DispatchFn:
+        """Fetch a registered dispatcher by name."""
+        if name not in self._dispatchers:
+            raise KeyError(f"No dispatcher registered: '{name}'")
+        return self._dispatchers[name]
+
+    def dispatch(self, prompt: str, name: str | None = None) -> str:
+        """Run a prompt through the named (or default) dispatcher."""
+        fn_name = name or self._default_name
+        if fn_name not in self._dispatchers:
+            raise KeyError(
+                f"No dispatcher registered: '{fn_name}'. "
+                f"Available: {list(self._dispatchers.keys())}"
+            )
+        return self._dispatchers[fn_name](prompt)
+
+
+# ---------------------------------------------------------------------------
 # DAG — dependency graph for task orchestration
 # ---------------------------------------------------------------------------
 
@@ -336,7 +388,10 @@ class OSWEngine:
                 or "/tmp/neuroflow_memory.db"
             )
         )
-        self._dispatch = dispatch_fn or self._default_dispatch
+        self._dispatchers = DispatcherRegistry()
+        self._dispatchers.register("hermes-cli", self._default_dispatch, default=True)
+        if dispatch_fn is not None:
+            self._dispatchers.register("custom", dispatch_fn, default=True)
         self.agents: dict[str, AgentCard] = {}
         self.goal: str = ""
         self.dag = DAG()
@@ -364,6 +419,10 @@ class OSWEngine:
 
     def register_agent(self, card: AgentCard) -> None:
         self.agents[card.name] = card
+
+    def register_dispatcher(self, name: str, fn: DispatchFn, *, default: bool = False) -> None:
+        """Register a named dispatch strategy. Pass ``default=True`` to switch default."""
+        self._dispatchers.register(name, fn, default=default)
 
     def ingest_goal(self, goal: str) -> str:
         self.goal = goal
@@ -396,12 +455,37 @@ class OSWEngine:
                                  json.dumps(node_ids), source="system")
             return node_ids
 
+    def _task_result(self, node_id: str, status: str,
+                     output_or_error: str, agent_name: str = "") -> dict[str, Any]:
+        """Build a Monadix-compliant result with reason and next_recommended_action."""
+        if status == "ok":
+            reason = f"Task '{node_id}' completed"
+            if agent_name:
+                reason += f" via agent '{agent_name}'"
+            next_action = "proceed" if not self._is_terminal_node(node_id) else "finalize"
+        else:
+            reason = f"Task '{node_id}' failed: {output_or_error}"
+            next_action = f"retry:{node_id}"
+
+        return {
+            "status": status,
+            "output": output_or_error if status == "ok" else "",
+            "error": output_or_error if status != "ok" else "",
+            "reason": reason,
+            "next_recommended_action": next_action,
+        }
+
+    def _is_terminal_node(self, node_id: str) -> bool:
+        """Check if a node has no downstream dependents (leaf / sink node)."""
+        return not any(node_id in deps for deps in self.dag.edges.values())
+
     def execute(self) -> dict[str, Any]:
         """Walk the DAG topologically and run each task. Returns {task_id: result}."""
         try:
             order = self.dag.topological_sort()
         except CycleError as e:
-            return {"error": str(e)}
+            return {"error": str(e), "reason": "DAG contains a cycle",
+                    "next_recommended_action": "fix_dag"}
 
         for node_id in order:
             node_data = self.dag.nodes.get(node_id, {})
@@ -413,8 +497,9 @@ class OSWEngine:
 
             try:
                 prompt = node_data.get("prompt", "")
-                result = self._dispatch(prompt)
-                self.results[node_id] = {"status": "ok", "output": result}
+                output = self._dispatchers.dispatch(prompt)
+                self.results[node_id] = self._task_result(
+                    node_id, "ok", output, agent_name)
 
                 with self._lock:
                     self._metrics["tasks_completed"] += 1
@@ -422,7 +507,9 @@ class OSWEngine:
                 if agent:
                     agent.state_machine.transition(AgentState.DONE)
             except Exception as exc:
-                self.results[node_id] = {"status": "failed", "error": str(exc)}
+                err = str(exc)
+                self.results[node_id] = self._task_result(
+                    node_id, "failed", err, agent_name)
                 with self._lock:
                     self._metrics["tasks_failed"] += 1
                 if agent:
@@ -435,10 +522,28 @@ class OSWEngine:
         return self.results
 
     def report(self) -> dict[str, Any]:
-        """Package up everything — goal, metrics, DAG stats, and per-task results."""
+        """Package up everything — goal, metrics, DAG stats, per-task results, and verdict."""
         elapsed = time.time() - self._metrics["started_at"] if self._metrics["started_at"] else 0
+        total = self._metrics["tasks_total"]
+        failed = self._metrics["tasks_failed"]
+        completed = self._metrics["tasks_completed"]
+
+        if total == 0:
+            verdict = "No tasks executed"
+            next_step = "decompose a goal first"
+        elif failed == 0:
+            verdict = f"All {completed} tasks completed successfully"
+            next_step = "finalize" if self.results else "continue"
+        else:
+            verdict = f"{failed} of {total} tasks failed"
+            failed_ids = [nid for nid, r in self.results.items()
+                          if r.get("status") == "failed"]
+            next_step = f"retry:{','.join(failed_ids)}"
+
         return {
             "goal": self.goal,
+            "verdict": verdict,
+            "next_step": next_step,
             "metrics": {
                 **self._metrics,
                 "elapsed_seconds": round(elapsed, 1),

@@ -665,3 +665,231 @@ class TestOSWEngine:
         assert report["metrics"]["tasks_total"] == 2
         assert report["metrics"]["tasks_completed"] == 2
         assert report["metrics"]["tasks_failed"] == 0
+
+
+# ======================================================================
+# Edge-case tests (Eval block — dispatch failure, output contract)
+# ======================================================================
+
+
+class TestDispatchFailure:
+    """What happens when dispatch_fn raises or returns garbage."""
+
+    def test_dispatch_raises_exception(self):
+        """Dispatch that raises should produce 'failed' status with error."""
+        def failing_dispatch(p):
+            raise RuntimeError("LLM quota exceeded")
+
+        engine = OSWEngine(dispatch_fn=failing_dispatch)
+        engine.ingest_goal("Failing task")
+        engine.decompose()
+        results = engine.execute()
+        assert results["root"]["status"] == "failed"
+        assert "LLM quota exceeded" in results["root"]["error"]
+
+    def test_dispatch_raises_sets_agent_failed(self):
+        """When dispatch fails, agent state should be FAILED."""
+        def failing_dispatch(p):
+            raise ValueError("Bad input")
+
+        engine = OSWEngine(dispatch_fn=failing_dispatch)
+        card = AgentCard(name="worker")
+        engine.register_agent(card)
+        engine.ingest_goal("Failing agent task")
+        tasks = [{"id": "t1", "prompt": "Do it", "agent": "worker", "depends_on": []}]
+        engine.decompose(tasks)
+        engine.execute()
+        assert engine.results["t1"]["status"] == "failed"
+        assert card.state_machine.state == AgentState.FAILED
+
+    def test_dispatch_non_string_result(self):
+        """Dispatch returning non-string should still be accepted (coerced by caller)."""
+        def weird_dispatch(p):
+            return 42  # int, not str
+
+        engine = OSWEngine(dispatch_fn=weird_dispatch)
+        engine.ingest_goal("Weird output")
+        engine.decompose()
+        results = engine.execute()
+        assert results["root"]["status"] == "ok"
+        # str(42) == "42"
+        assert isinstance(results["root"]["output"], int)
+
+    def test_dispatch_empty_string(self):
+        """Dispatch returning empty string should succeed with empty output."""
+        def empty_dispatch(p):
+            return ""
+
+        engine = OSWEngine(dispatch_fn=empty_dispatch)
+        engine.ingest_goal("Empty")
+        engine.decompose()
+        results = engine.execute()
+        assert results["root"]["status"] == "ok"
+        assert results["root"]["output"] == ""
+
+    def test_partial_failure_in_chain(self):
+        """Chain: A succeeds, B fails, C depends on B — C should still run (no skip)."""
+        call_log = []
+
+        def chain_dispatch(prompt):
+            call_log.append(prompt[:20])
+            if "fail" in prompt:
+                raise RuntimeError("B failed")
+            return f"done: {prompt[:20]}"
+
+        engine = OSWEngine(dispatch_fn=chain_dispatch)
+        engine.ingest_goal("Partial fail")
+        tasks = [
+            {"id": "a", "prompt": "success A", "depends_on": []},
+            {"id": "b", "prompt": "fail B", "depends_on": ["a"]},
+            {"id": "c", "prompt": "success C", "depends_on": ["b"]},
+        ]
+        engine.decompose(tasks)
+        results = engine.execute()
+        assert results["a"]["status"] == "ok"
+        assert results["b"]["status"] == "failed"
+        assert results["c"]["status"] == "ok"
+        assert len(call_log) == 3  # all three ran
+
+    def test_metrics_reflect_failures(self):
+        """After partial failure, metrics should show both completed and failed."""
+        def half_fail(p):
+            if "fail" in p:
+                raise RuntimeError("boom")
+            return "ok"
+
+        engine = OSWEngine(dispatch_fn=half_fail)
+        engine.ingest_goal("Metrics with fails")
+        tasks = [
+            {"id": "ok1", "prompt": "fine", "depends_on": []},
+            {"id": "fail1", "prompt": "fail myself", "depends_on": []},
+        ]
+        engine.decompose(tasks)
+        engine.execute()
+        report = engine.report()
+        assert report["metrics"]["tasks_total"] == 2
+        assert report["metrics"]["tasks_completed"] == 1
+        assert report["metrics"]["tasks_failed"] == 1
+
+    def test_all_fail_metrics(self):
+        """When every task fails, metrics should show 0 completed, N failed."""
+        def always_fail(p):
+            raise RuntimeError("always fails")
+
+        engine = OSWEngine(dispatch_fn=always_fail)
+        engine.ingest_goal("All fail")
+        tasks = [
+            {"id": "a", "prompt": "A", "depends_on": []},
+            {"id": "b", "prompt": "B", "depends_on": ["a"]},
+        ]
+        engine.decompose(tasks)
+        engine.execute()
+        report = engine.report()
+        assert report["metrics"]["tasks_total"] == 2
+        assert report["metrics"]["tasks_completed"] == 0
+        assert report["metrics"]["tasks_failed"] == 2
+
+
+# ======================================================================
+# DispatcherRegistry — pluggable dispatch
+# ======================================================================
+
+
+class TestDispatcherRegistry:
+    def test_register_and_dispatch(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        reg.register("mock", lambda p: f"result:{p}", default=True)
+        assert reg.dispatch("hello") == "result:hello"
+
+    def test_default_takes_first(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        reg.register("a", lambda p: "from-a")
+        reg.register("b", lambda p: "from-b")
+        assert reg.default_name == "a"
+
+    def test_explicit_default_override(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        reg.register("a", lambda p: "from-a")
+        reg.register("b", lambda p: "from-b", default=True)
+        assert reg.default_name == "b"
+        assert reg.dispatch("x") == "from-b"
+
+    def test_dispatch_by_name(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        reg.register("mock", lambda p: "default", default=True)
+        reg.register("alt", lambda p: "alt-mode")
+        assert reg.dispatch("x", name="alt") == "alt-mode"
+
+    def test_list_returns_names(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        reg.register("a", lambda p: "")
+        reg.register("b", lambda p: "")
+        assert sorted(reg.list()) == ["a", "b"]
+
+    def test_get_returns_fn(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        fn = lambda p: "yes"
+        reg.register("x", fn)
+        assert reg.get("x") is fn
+
+    def test_get_unknown_raises(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        with pytest.raises(KeyError, match="No dispatcher registered: 'nope'"):
+            reg.get("nope")
+
+    def test_dispatch_unknown_raises(self):
+        from neuroflow_core.osw_engine import DispatcherRegistry
+
+        reg = DispatcherRegistry()
+        with pytest.raises(KeyError, match="No dispatcher registered"):
+            reg.dispatch("x")
+
+
+class TestDispatcherRegistryIntegration:
+    """Registry integrated with OSWEngine."""
+
+    def test_register_dispatcher(self):
+        engine = OSWEngine()
+        engine.register_dispatcher("test-dispatch", lambda p: f"custom:{p}")
+        assert "test-dispatch" in engine._dispatchers.list()
+
+    def test_register_dispatcher_sets_default(self):
+        engine = OSWEngine()
+        engine.register_dispatcher("primary", lambda p: "primary", default=True)
+        engine.ingest_goal("test")
+        engine.decompose([{"id": "t1", "prompt": "go", "depends_on": []}])
+        results = engine.execute()
+        assert results["t1"]["output"] == "primary"
+
+    def test_register_dispatcher_does_not_break_existing_tests(self):
+        """Existing tests pass dispatch_fn — it becomes 'custom' default."""
+        engine = OSWEngine(dispatch_fn=lambda p: f"legacy:{p}")
+        assert engine._dispatchers.default_name == "custom"
+        engine.ingest_goal("test")
+        engine.decompose([{"id": "t1", "prompt": "go", "depends_on": []}])
+        results = engine.execute()
+        assert results["t1"]["output"] == "legacy:go"
+
+    def test_register_dispatcher_override_default(self):
+        """register_dispatcher with default=True replaces the default."""
+        engine = OSWEngine(dispatch_fn=lambda p: "old-default")
+        engine.register_dispatcher("new-default", lambda p: "new-default", default=True)
+        assert engine._dispatchers.default_name == "new-default"
+        engine.ingest_goal("override")
+        engine.decompose([{"id": "t1", "prompt": "go", "depends_on": []}])
+        results = engine.execute()
+        assert results["t1"]["output"] == "new-default"

@@ -8,10 +8,12 @@ import pytest
 
 from neuroflow_core.telegram_ingestor import (
     IngestorConfig,
+    RateLimiter,
     config_from_env,
     TelegramIngestor,
     UserStore,
 )
+from neuroflow_core.telegram_segmentation import Trigger
 
 
 # ======================================================================
@@ -30,6 +32,8 @@ class TestIngestorConfig:
         assert config.cold_days == 7
         assert config.churn_days == 30
         assert config.allowed_chat_ids is None
+        assert config.rate_limit_max_events == 0
+        assert config.rate_limit_window_s == 60
 
     def test_custom_values(self):
         config = IngestorConfig(
@@ -157,31 +161,101 @@ class TestUserStore:
 # ======================================================================
 
 
+# ======================================================================
+# RateLimiter (Monadix Safety block)
+# ======================================================================
+
+
+class TestRateLimiter:
+    def test_disabled_by_default(self):
+        """max_events=0 means no limit."""
+        rl = RateLimiter(max_events=0, window_s=60)
+        for _ in range(1000):
+            assert rl.allow(42)
+        assert rl.remaining(42) == 999
+
+    def test_blocks_after_limit(self):
+        rl = RateLimiter(max_events=3, window_s=60)
+        assert rl.allow(1)
+        assert rl.allow(1)
+        assert rl.allow(1)
+        assert not rl.allow(1)  # 4th blocked
+
+    def test_independent_per_user(self):
+        rl = RateLimiter(max_events=2, window_s=60)
+        assert rl.allow(10)
+        assert rl.allow(10)
+        assert not rl.allow(10)  # blocked
+        assert rl.allow(20)       # different user — allowed
+        assert rl.allow(20)
+        assert not rl.allow(20)  # blocked
+
+    def test_window_expiry(self):
+        """After window_s passes, old events expire and user can fire again."""
+        rl = RateLimiter(max_events=1, window_s=60)
+        assert rl.allow(5)
+        assert not rl.allow(5)
+        # Travel forward in time by faking the bucket
+        rl._buckets[5] = [0.0]  # far in the past
+        assert rl.allow(5)  # expired, allowed again
+
+    def test_remaining_counts_down(self):
+        rl = RateLimiter(max_events=5, window_s=60)
+        assert rl.remaining(9) == 5
+        rl.allow(9)
+        assert rl.remaining(9) == 4
+        rl.allow(9)
+        assert rl.remaining(9) == 3
+
+    def test_reset_clears_per_user(self):
+        rl = RateLimiter(max_events=2, window_s=60)
+        rl.allow(7)
+        rl.allow(7)
+        assert not rl.allow(7)
+        rl.reset(7)
+        assert rl.allow(7)  # reset, allowed again
+
+    def test_reset_all_clears_everyone(self):
+        rl = RateLimiter(max_events=1, window_s=60)
+        rl.allow(1)
+        rl.allow(2)
+        assert not rl.allow(1)
+        assert not rl.allow(2)
+        rl.reset()
+        assert rl.allow(1)
+        assert rl.allow(2)
+
+
+# ======================================================================
+# TelegramIngestor — message classification
+# ======================================================================
+
+
 class TestClassifyMessage:
     def test_new_chat_members(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)
         result = ingestor._classify_message({"new_chat_members": [{"id": 1}]})
-        assert result == "joined"
+        assert result == Trigger.JOINED
 
     def test_left_chat_member(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)
         result = ingestor._classify_message({"left_chat_member": {"id": 1}})
-        assert result == "left"
+        assert result == Trigger.LEFT
 
     def test_question_message(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)
         result = ingestor._classify_message({"text": "How does this work?"})
-        assert result == "question"
+        assert result == Trigger.ASKED_QUESTION
 
     def test_link_message(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)
         result = ingestor._classify_message({"text": "Check https://example.com"})
-        assert result == "link"
+        assert result == Trigger.CLICKED_LINK
 
     def test_regular_message(self, ingestor_config):
         ingestor = TelegramIngestor(ingestor_config)
         result = ingestor._classify_message({"text": "Hello everyone"})
-        assert result == "message"
+        assert result == Trigger.REPLIED
 
     def test_callback_query_handled_at_update_level(self, ingestor_config):
         """Callback queries are handled by _process_update, not _classify_message."""
@@ -201,14 +275,14 @@ class TestClassifyMessage:
         for prefix in ["what", "how", "why", "when", "where", "who", "can", "do", "is"]:
             ingestor = TelegramIngestor(ingestor_config)
             result = ingestor._classify_message({"text": f"{prefix} is this thing?"})
-            assert result == "question", f"'{prefix}' should be classified as question"
+            assert result == Trigger.ASKED_QUESTION, f"'{prefix}' should be classified as question"
 
     def test_link_by_domain(self, ingestor_config):
         """Messages containing typical URL patterns."""
         for domain in [".com", ".ru", ".org", ".net", "t.me", "https://", "http://"]:
             ingestor = TelegramIngestor(ingestor_config)
             result = ingestor._classify_message({"text": f"Visit us at site{domain}/page"})
-            assert result == "link", f"'{domain}' should be classified as link"
+            assert result == Trigger.CLICKED_LINK, f"'{domain}' should be classified as link"
 
 
 # ======================================================================

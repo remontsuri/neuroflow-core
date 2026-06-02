@@ -507,3 +507,210 @@ class TestTelegramSegmenter:
         with open(path) as f:
             data = json.load(f)
         assert data["total_users"] == 1
+
+
+# ======================================================================
+# Edge-case tests (Eval block — Monadix contract)
+# ======================================================================
+
+
+class TestEdgeCases:
+    """Reactivation, churn recovery, stale leads, duplicate merging, rapid transitions."""
+
+    # ------------------------------------------------------------------
+    # 1. Full churn recovery cycle
+    # ------------------------------------------------------------------
+
+    def test_full_churn_recovery_cycle(self, segmenter):
+        """User: LEAD -> ACTIVE -> COLD -> CHURNED -> ACTIVE -> WARM -> HOT."""
+        # Phase 1: onboard
+        segmenter.process_message(1, "viewed")       # LEAD -> ACTIVE
+        assert segmenter.get_segment(1) == "active"
+
+        # Phase 2: go cold
+        segmenter.process_message(1, "silent_7d")    # ACTIVE -> COLD
+        assert segmenter.get_segment(1) == "cold"
+
+        # Phase 3: churn
+        segmenter.process_message(1, "silent_30d")   # COLD -> CHURNED
+        assert segmenter.get_segment(1) == "churned"
+
+        # Phase 4: re-engage
+        segmenter.process_message(1, "viewed")       # CHURNED -> ACTIVE
+        assert segmenter.get_segment(1) == "active"
+
+        # Phase 5: warm up
+        segmenter.process_message(1, "replied")      # ACTIVE -> WARM
+        assert segmenter.get_segment(1) == "warm"
+
+        # Phase 6: convert
+        segmenter.process_message(1, "dm")           # WARM -> HOT
+        assert segmenter.get_segment(1) == "hot"
+        assert segmenter.get_user(1).dm_count == 1
+        assert segmenter.get_user(1).state.is_convertible() is True
+
+    def test_churn_recovery_from_cold_via_reply(self, segmenter):
+        """Churned user replies → WARM directly (CHURNED+REPLIED)."""
+        segmenter.process_message(1, "left")          # LEAD -> CHURNED
+        segmenter.process_message(1, "replied")       # CHURNED -> WARM
+        assert segmenter.get_segment(1) == "warm"
+        assert segmenter.get_user(1).state.is_convertible() is True
+
+    def test_churn_recovery_twice(self, segmenter):
+        """Multiple churn-recovery cycles should work."""
+        for cycle in range(3):
+            uid = 100 + cycle
+            segmenter.process_message(uid, "viewed")   # LEAD -> ACTIVE
+            segmenter.process_message(uid, "silent_7d") # ACTIVE -> COLD
+            segmenter.process_message(uid, "silent_30d")# ... -> CHURNED
+            segmenter.process_message(uid, "viewed")    # back to ACTIVE
+            assert segmenter.get_segment(uid) == "active", f"cycle {cycle} failed"
+
+    # ------------------------------------------------------------------
+    # 2. Stale lead behaviour
+    # ------------------------------------------------------------------
+
+    def test_stale_lead_churns_via_decay(self, segmenter):
+        """LEAD inactive for > churn_threshold transitions to CHURNED via decay."""
+        segmenter.process_message(1, "joined")   # stays LEAD
+        assert segmenter.get_segment(1) == "lead"
+        user = segmenter.get_user(1)
+        user.last_active = time.time() - (365 * 86400)  # a year ago
+        segmenter.run_decay()
+        assert user.state == UserState.CHURNED  # LEAD -> SILENT_30D -> CHURNED
+        assert user.history[-1]["trigger"] == "decay:silent_30d"
+
+    def test_stale_lead_churn_via_silent_30d_event(self, segmenter):
+        """If a SILENT_30D event arrives for a LEAD, it should transition to CHURNED."""
+        segmenter.process_message(1, "joined")       # stays LEAD
+        segmenter.process_message(1, "silent_30d")    # LEAD+SILENT_30D is in TRANSITIONS -> CHURNED
+        assert segmenter.get_segment(1) == "churned"
+
+    def test_stale_lead_churn_via_left(self, segmenter):
+        """LEAD who leaves → CHURNED."""
+        segmenter.process_message(1, "joined")  # LEAD
+        segmenter.process_message(1, "left")    # LEAD -> CHURNED
+        assert segmenter.get_segment(1) == "churned"
+
+    def test_stale_lead_banned_on_spam(self, segmenter):
+        """LEAD who spams → BANNED."""
+        segmenter.process_message(1, "joined")
+        segmenter.process_message(1, "spam")
+        assert segmenter.get_segment(1) == "banned"
+
+    # ------------------------------------------------------------------
+    # 3. Duplicate / idempotent event handling
+    # ------------------------------------------------------------------
+
+    def test_duplicate_same_event_no_double_transition(self, segmenter):
+        """Same event back-to-back should not create extra transitions."""
+        segmenter.process_message(1, "viewed")  # LEAD -> ACTIVE
+        segmenter.process_message(1, "viewed")  # ACTIVE stays ACTIVE (no transition in TRANSITIONS)
+        user = segmenter.get_user(1)
+        # only one transition logged (LEAD->ACTIVE), second event doesn't change state
+        assert len(user.history) == 1
+        assert user.message_count == 2  # message_count still increments
+
+    def test_duplicate_unknown_trigger_ignored(self, segmenter):
+        """Same unknown trigger twice should not create user."""
+        segmenter.process_message(1, "unknown_event")
+        segmenter.process_message(1, "unknown_event")
+        assert segmenter.get_user(1) is None
+
+    def test_duplicate_same_user_multiple_sources(self, segmenter):
+        """User created from different caller paths should collapse to one profile."""
+        user_a = segmenter.get_or_create(42, username="alice")
+        user_b = segmenter.get_or_create(42, username="bob")
+        assert user_a is user_b  # same object
+        assert user_a.username == "alice"  # first call sets username
+        # Second call with different username doesn't overwrite existing
+        segmenter.process_message(42, "viewed")
+        assert segmenter.get_user(42) is not None
+
+    def test_duplicate_message_only_increments_count(self, segmenter):
+        """Repeated same-state triggers should only bump message_count."""
+        segmenter.process_message(1, "viewed")  # LEAD -> ACTIVE
+        segmenter.process_message(1, "viewed")  # ACTIVE -> ACTIVE (no transition)
+        segmenter.process_message(1, "viewed")  # ACTIVE -> ACTIVE
+        user = segmenter.get_user(1)
+        assert user.message_count == 3
+        assert len(user.history) == 1  # only LEAD->ACTIVE
+
+    # ------------------------------------------------------------------
+    # 4. Rapid transitions — burst of events
+    # ------------------------------------------------------------------
+
+    def test_rapid_transitions_full_flow(self, segmenter):
+        """Simulate a user rapidly clicking through the funnel."""
+        events = ["viewed", "replied", "dm", "purchase"]
+        for e in events:
+            segmenter.process_message(1, e)
+        # Expected path: LEAD -> ACTIVE -> WARM -> HOT -> HOT (purchased from HOT stays HOT)
+        assert segmenter.get_segment(1) == "hot"
+        user = segmenter.get_user(1)
+        assert user.message_count == 4
+        assert len(user.history) == 3  # LEAD->ACTIVE, ACTIVE->WARM, WARM->HOT
+
+    def test_rapid_transitions_loop(self, segmenter):
+        """Rapid state transitions should not corrupt internal state."""
+        for i in range(50):
+            segmenter.process_message(1, "viewed")   # ACTIVE if already, LEAD->ACTIVE on first
+            segmenter.process_message(1, "dm")       # ACTIVE -> HOT
+            segmenter.process_message(1, "silent_7d")# HOT -> COLD
+            segmenter.process_message(1, "replied")  # COLD -> WARM
+        user = segmenter.get_user(1)
+        # Sanity: state machine still works, no crash
+        assert user.state in (UserState.WARM, UserState.HOT)
+        assert user.message_count == 200  # 50 * 4 = 200
+
+    def test_multiple_users_concurrent_events(self, segmenter):
+        """Interleaving events for multiple users should not cross-contaminate."""
+        segmenter.process_message(1, "viewed")   # 1 -> ACTIVE
+        segmenter.process_message(2, "replied")  # 2 -> WARM
+        segmenter.process_message(1, "dm")       # 1 -> HOT
+        segmenter.process_message(3, "spam")     # 3 -> BANNED
+        segmenter.process_message(2, "dm")       # 2 -> HOT
+
+        assert segmenter.get_segment(1) == "hot"
+        assert segmenter.get_segment(2) == "hot"
+        assert segmenter.get_segment(3) == "banned"
+
+    def test_multiple_users_rapid_interleaved(self, segmenter):
+        """Rapid fire events across many users, mimicking real Telegram load."""
+        for i in range(10):
+            uid = 100 + i
+            segmenter.process_message(uid, "viewed")
+            segmenter.process_message(uid, "replied")
+            segmenter.process_message(uid, "question")
+
+        counts = segmenter.segment_counts()
+        # All went LEAD->ACTIVE->WARM->WARM (question from WARM stays WARM)
+        assert counts.get("warm", 0) == 10
+        assert segmenter.export()["total_users"] == 10
+
+    # ------------------------------------------------------------------
+    # 5. History integrity
+    # ------------------------------------------------------------------
+
+    def test_history_tracks_all_unique_transitions(self, segmenter):
+        """History should contain every actual state change."""
+        segmenter.process_message(1, "viewed")       # LEAD -> ACTIVE
+        segmenter.process_message(1, "dm")            # ACTIVE -> HOT
+        segmenter.process_message(1, "silent_7d")     # HOT -> COLD
+        segmenter.process_message(1, "replied")       # COLD -> WARM
+        user = segmenter.get_user(1)
+        expected = ["active", "hot", "cold", "warm"]
+        assert [h["to"] for h in user.history] == expected
+
+    def test_history_format(self, segmenter):
+        """Each history entry should have required fields."""
+        segmenter.process_message(1, "viewed")
+        user = segmenter.get_user(1)
+        entry = user.history[0]
+        assert "from" in entry
+        assert "to" in entry
+        assert "trigger" in entry
+        assert "ts" in entry
+        assert entry["from"] == "lead"
+        assert entry["to"] == "active"
+        assert entry["trigger"] == "viewed"

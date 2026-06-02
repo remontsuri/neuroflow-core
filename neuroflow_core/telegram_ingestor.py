@@ -22,7 +22,9 @@ from urllib.parse import urlparse, parse_qs
 import httpx
 
 from neuroflow_core.telegram_segmentation import (
+    TelegramEvent,
     TelegramSegmenter,
+    Trigger,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,8 @@ class IngestorConfig:
     cold_days: int = 7
     churn_days: int = 30
     allowed_chat_ids: list[int] | None = None  # None = listen to all
+    rate_limit_max_events: int = 0   # 0 = no limit
+    rate_limit_window_s: int = 60    # sliding window in seconds
 
 
 def config_from_env() -> IngestorConfig:
@@ -171,6 +175,68 @@ class UserStore:
                 "SELECT COUNT(*) FROM users"
             ).fetchone()[0]
             return result or 0
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (Safety block — Monadix)
+# ---------------------------------------------------------------------------
+
+
+class RateLimiter:
+    """Per-user sliding window rate limiter.
+
+    Tracks event timestamps per user_id and rejects if the count within the
+    window exceeds the configured max. Thread-safe via threading.Lock.
+
+        limiter = RateLimiter(max_events=5, window_s=60)
+        if limiter.allow(42):
+            process_event(...)
+    """
+
+    def __init__(self, max_events: int = 0, window_s: int = 60):
+        self.max_events = max_events
+        self.window_s = window_s
+        self._buckets: dict[int, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, user_id: int) -> bool:
+        """Check whether *user_id* may fire another event. Idempotent.*"""
+        if self.max_events <= 0:
+            return True  # disabled
+
+        now = time.time()
+        cutoff = now - self.window_s
+
+        with self._lock:
+            timestamps = self._buckets.get(user_id, [])
+            # Prune old entries
+            timestamps = [t for t in timestamps if t > cutoff]
+
+            if len(timestamps) >= self.max_events:
+                self._buckets[user_id] = timestamps
+                return False
+
+            timestamps.append(now)
+            self._buckets[user_id] = timestamps
+            return True
+
+    def remaining(self, user_id: int) -> int:
+        """How many more events *user_id* can fire within the current window."""
+        if self.max_events <= 0:
+            return 999
+        now = time.time()
+        cutoff = now - self.window_s
+        with self._lock:
+            timestamps = [t for t in self._buckets.get(user_id, []) if t > cutoff]
+        return max(0, self.max_events - len(timestamps))
+
+    def reset(self, user_id: int | None = None) -> None:
+        """Clear tracking for *user_id*, or all users if None."""
+        with self._lock:
+            if user_id is not None:
+                self._buckets.pop(user_id, None)
+            else:
+                self._buckets.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -360,13 +426,17 @@ class TelegramIngestor:
     """
 
     def __init__(self, config: IngestorConfig):
-        """Wire up the ingestor: segmenter, user store, HTTP client."""
+        """Wire up the ingestor: segmenter, user store, rate limiter, HTTP client."""
         self.config = config
         self.segmenter = TelegramSegmenter(
             cold_threshold_days=config.cold_days,
             churn_threshold_days=config.churn_days,
         )
         self.store = UserStore(config.db_path)
+        self.rate_limiter = RateLimiter(
+            max_events=config.rate_limit_max_events,
+            window_s=config.rate_limit_window_s,
+        )
         self._http_client: httpx.Client | None = None
         self._running = False
         self._update_id = 0
@@ -431,13 +501,21 @@ class TelegramIngestor:
         user_id = user_from["id"]
         username = user_from.get("username", "") or user_from.get("first_name", "")
 
+        # Safety: rate limit per-user
+        if not self.rate_limiter.allow(user_id):
+            logger.debug("rate limited user_id=%d (remaining=%d)",
+                         user_id, self.rate_limiter.remaining(user_id))
+            return
+
         # Classify the message type
-        msg_type = self._classify_message(msg)
-        if not msg_type:
+        trigger = self._classify_message(msg)
+        if not trigger:
             return
 
         old_state = self.segmenter.get_segment(user_id)
-        new_state = self.segmenter.process_message(user_id, msg_type, username=username)
+        new_state = self.segmenter.process_event(
+            TelegramEvent(user_id=user_id, trigger=trigger, username=username)
+        )
 
         if new_state:
             self.store.upsert_user(
@@ -447,26 +525,26 @@ class TelegramIngestor:
             )
             self.store.log_event(
                 user_id=user_id,
-                event_type=msg_type,
+                event_type=trigger.value,
                 state_from=old_state or "unknown",
                 state_to=new_state.value,
                 metadata={"chat_id": chat_id},
             )
 
-    def _classify_message(self, msg: dict[str, Any]) -> str | None:
-        """Guess the event type from a Telegram message object."""
+    def _classify_message(self, msg: dict[str, Any]) -> Trigger | None:
+        """Guess the Trigger from a Telegram message object."""
         if "new_chat_members" in msg:
-            return "joined"
+            return Trigger.JOINED
         if "left_chat_member" in msg:
-            return "left"
+            return Trigger.LEFT
         if "text" in msg:
             text = msg["text"].lower()
             if "?" in text or text.startswith(("what", "how", "why", "when", "where", "who", "can", "do", "is")):
-                return "question"
+                return Trigger.ASKED_QUESTION
             if any(domain in text for domain in
                    (".com", ".ru", ".org", ".net", "t.me", "https://", "http://")):
-                return "link"
-            return "message"
+                return Trigger.CLICKED_LINK
+            return Trigger.REPLIED
         return None
 
     # ------------------------------------------------------------------

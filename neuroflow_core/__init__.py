@@ -25,6 +25,7 @@ from neuroflow_core.osw_engine import (
     AgentCard,
     AgentState,
     DispatchFn,
+    DispatcherRegistry,
 )
 
 __all__ = [
@@ -44,4 +45,5 @@ __all__ = [
     "AgentCard",
     "AgentState",
     "DispatchFn",
+    "DispatcherRegistry",
 ]
