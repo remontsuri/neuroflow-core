@@ -1,0 +1,28 @@
+services:
+  neuroflow:
+    build: .
+    container_name: neuroflow
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      - neuroflow_data:/data
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:?Please set TELEGRAM_BOT_TOKEN}
+      - NEUROFLOW_PORT=${NEUROFLOW_PORT:-8888}
+      - NEUROFLOW_DB_PATH=${NEUROFLOW_DB_PATH:-/data/neuroflow.db}
+      - NEUROFLOW_API_KEY=${NEUROFLOW_API_KEY:-}
+      - NEUROFLOW_POLL_INTERVAL=${NEUROFLOW_POLL_INTERVAL:-5}
+      - NEUROFLOW_COLD_DAYS=${NEUROFLOW_COLD_DAYS:-7}
+      - NEUROFLOW_CHURN_DAYS=${NEUROFLOW_CHURN_DAYS:-30}
+      - NEUROFLOW_ALLOWED_CHATS=${NEUROFLOW_ALLOWED_CHATS:-}
+      - NEUROFLOW_LOG_LEVEL=${NEUROFLOW_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8888/health', timeout=5).raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  neuroflow_data:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -23,6 +24,8 @@ import httpx
 from neuroflow_core.telegram_segmentation import (
     TelegramSegmenter,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -51,7 +54,6 @@ def config_from_env() -> IngestorConfig:
     """
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
     if not token:
-        # Fallback: try reading from .env file
         env_path = "/opt/data/.env"
         if os.path.exists(env_path):
             with open(env_path) as f:
@@ -61,7 +63,7 @@ def config_from_env() -> IngestorConfig:
                         token = line.split("=", 1)[1]
                         break
 
-    db_path = os.environ.get("NEUROFLOW_INGESTOR_DB_PATH", "/tmp/telegram_ingestor.db")
+    db_path = os.environ.get("NEUROFLOW_DB_PATH", "/data/neuroflow.db")
     return IngestorConfig(bot_token=token, db_path=db_path)
 
 
@@ -243,6 +245,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path in ("", "/dashboard"):
             self._serve_dashboard(store)
+        elif path == "/health":
+            self._json_response({"status": "ok"})
         elif path == "/api/segments":
             self._json_response({
                 "total_users": store.total_users(),
@@ -393,11 +397,11 @@ class TelegramIngestor:
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:
-            print(f"[ingestor] poll error: {exc}")
+            logger.warning("poll error: %s", exc)
             return 0
 
         if not data.get("ok"):
-            print(f"[ingestor] API error: {data.get('description', 'unknown')}")
+            logger.warning("API error: %s", data.get("description", "unknown"))
             return 0
 
         updates = data.get("result", [])
@@ -480,7 +484,7 @@ class TelegramIngestor:
         poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         poll_thread.start()
 
-        print(f"[ingestor] HTTP server on :{self.config.http_port}")
+        logger.info("HTTP server on :%d", self.config.http_port)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -492,7 +496,7 @@ class TelegramIngestor:
         while self._running:
             count = self.poll_once()
             if count:
-                print(f"[ingestor] processed {count} updates")
+                logger.info("processed %d updates", count)
             time.sleep(self.config.poll_interval_s)
 
     def stop(self) -> None:

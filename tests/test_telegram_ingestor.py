@@ -256,7 +256,7 @@ class TestPollOnce:
         user_profile = ingestor.segmenter.get_user(42)
         assert user_profile is not None
 
-    def test_poll_api_error(self, ingestor_config, capsys):
+    def test_poll_api_error(self, ingestor_config, caplog):
         ingestor, mock_client = self._make_ingestor(ingestor_config)
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"ok": False, "description": "Bad token"}
@@ -264,18 +264,16 @@ class TestPollOnce:
 
         count = ingestor.poll_once()
         assert count == 0
-        captured = capsys.readouterr()
-        assert "API error" in captured.out
+        assert "API error" in caplog.text
 
-    def test_poll_http_error(self, ingestor_config, capsys):
+    def test_poll_http_error(self, ingestor_config, caplog):
         ingestor, mock_client = self._make_ingestor(ingestor_config)
         import httpx
         mock_client.get.side_effect = httpx.HTTPError("Connection failed")
 
         count = ingestor.poll_once()
         assert count == 0
-        captured = capsys.readouterr()
-        assert "poll error" in captured.out
+        assert "poll error" in caplog.text
 
     def test_poll_respects_allowed_chat_ids(self, ingestor_config):
         ingestor_config.allowed_chat_ids = [-100999]
