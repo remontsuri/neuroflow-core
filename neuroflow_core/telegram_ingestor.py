@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs
 
 import httpx
 
+from neuroflow_core.osw_engine import OSWEngine
 from neuroflow_core.telegram_segmentation import (
     TelegramEvent,
     TelegramSegmenter,
@@ -432,9 +433,10 @@ class TelegramIngestor:
         ingestor.start()  # blocks forever
     """
 
-    def __init__(self, config: IngestorConfig):
+    def __init__(self, config: IngestorConfig, engine: OSWEngine | None = None):
         """Wire up the ingestor: segmenter, user store, rate limiter, HTTP client."""
         self.config = config
+        self.engine = engine
         self.segmenter = TelegramSegmenter(
             cold_threshold_days=config.cold_days,
             churn_threshold_days=config.churn_days,
@@ -537,6 +539,24 @@ class TelegramIngestor:
                 state_to=new_state.value,
                 metadata={"chat_id": chat_id},
             )
+        # Route through OSWEngine if connected
+        if self.engine is not None:
+            try:
+                goal = (
+                    f"telegram_event: user={user_id} username={username} "
+                    f"trigger={trigger.value} state={new_state.value if new_state else old_state}"
+                )
+                self.engine.ingest_goal(goal)
+                self.engine.decompose([{
+                    "id": f"evt:{user_id}:{int(time.time())}",
+                    "prompt": goal,
+                    "depends_on": [],
+                }])
+                result = self.engine.execute()
+                logger.debug("OSW result for user_id=%d: %s", user_id,
+                             result.get(list(result.keys())[0], {}) if result else "none")
+            except Exception as exc:
+                logger.warning("OSW pipeline error for user_id=%d: %s", user_id, exc)
 
     def _classify_message(self, msg: dict[str, Any]) -> Trigger | None:
         """Guess the Trigger from a Telegram message object."""
